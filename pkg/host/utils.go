@@ -75,6 +75,8 @@ type HostUtils interface {
 	SetMaxReadRequestSize(pciAddr string, maxReadRequestSize int) error
 	// SetTrustAndPFC sets trust and PFC settings for a network interface
 	SetTrustAndPFC(interfaceName string, trust string, pfc string) error
+	// ScheduleReboot schedules reboot on the host
+	ScheduleReboot() error
 }
 
 type hostUtils struct {
@@ -557,6 +559,18 @@ func (h *hostUtils) SetTrustAndPFC(interfaceName string, trust string, pfc strin
 	if err != nil {
 		err = fmt.Errorf("failed to run mlnx_qos: %s", output)
 		log.Log.Error(err, "SetTrustAndPFC(): Failed to run mlnx_qos")
+		return err
+	}
+	return nil
+}
+
+func (h *hostUtils) ScheduleReboot() error {
+	log.Log.Info("HostUtils.ScheduleReboot()")
+
+	cmd := h.execInterface.Command("shutdown", "-r")
+	_, err := cmd.Output()
+	if err != nil {
+		log.Log.Error(err, "ScheduleReboot(): Failed to run shutdown -r")
 		return err
 	}
 	return nil
