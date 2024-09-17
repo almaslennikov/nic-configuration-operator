@@ -248,6 +248,17 @@ yq: $(YQ) ## Download yq locally if necessary.
 $(YQ): | $(LOCALBIN)
 	@curl -fsSL -o $(YQ) https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_linux_amd64 && chmod +x $(YQ)
 
+HELM := $(abspath $(LOCALBIN)/helm)
+.PHONY: helm
+helm: $(HELM) ## Download helm (last release) locally if necessary.
+$(HELM): | $(LOCALBIN)
+	@{ \
+		curl -fsSL -o $(LOCALBIN)/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && \
+		chmod 700 $(LOCALBIN)/get_helm.sh && \
+		HELM_INSTALL_DIR=$(LOCALBIN) USE_SUDO=false $(LOCALBIN)/get_helm.sh && \
+		rm -f $(LOCALBIN)/get_helm.sh; \
+	}
+
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)

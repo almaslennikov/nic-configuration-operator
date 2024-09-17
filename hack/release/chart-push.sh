@@ -10,7 +10,7 @@ GITHUB_TAG=${GITHUB_TAG:-}
 
 BASE=${PWD}
 HELM_CMD="${BASE}/bin/helm"
-HELM_CHART=${BASE}/deployment/maintenance-operator-chart
+HELM_CHART=${BASE}/deployment/nic-configuration-operator
 HELM_CHART_VERSION=${GITHUB_TAG#"v"}
 HELM_CHART_TARBALL="nic-configuration-operator-chart-${HELM_CHART_VERSION}.tgz"
 
