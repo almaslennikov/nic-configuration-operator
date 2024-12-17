@@ -3,6 +3,6 @@ resources:
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
-- name: controller
-  newName: nic-configuration-operator
-  newTag: latest
+- digest: sha256:aedef75cb66769f9f35b64fba78b91be41eb39c2435d5da9b4c0afef299ab600
+  name: controller
+  newName: harbor.mellanox.com/cloud-orchestration-dev/amaslennikov/nic-configuration-operator
