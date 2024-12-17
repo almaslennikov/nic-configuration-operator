@@ -72,10 +72,6 @@ spec:
         env:
           - name: LOG_LEVEL
             value: info
-          - name: POD_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.name
           - name: NAMESPACE
             valueFrom:
               fieldRef:
@@ -92,8 +88,6 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
         resources:
           limits:
             cpu: 500m
@@ -101,5 +95,5 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
-      serviceAccountName: nic-configuration-operator
+      serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
