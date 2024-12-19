@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -36,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/Mellanox/nic-configuration-operator/api/v1alpha1"
+	"github.com/Mellanox/nic-configuration-operator/pkg/syncdaemon"
 )
 
 const nicConfigurationTemplateSyncEventName = "nic-configuration-template-sync-event"
@@ -54,10 +56,14 @@ type NicConfigurationTemplateReconciler struct {
 //+kubebuilder:rbac:groups=configuration.net.nvidia.com,resources=nicdevices,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=configuration.net.nvidia.com,resources=nicdevices/finalizers,verbs=update
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get
+//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=events,verbs=create
 //+kubebuilder:rbac:groups="",resources=pods,verbs=list
 //+kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create;delete;get;list;patch;update;watch
 //+kubebuilder:rbac:groups=maintenance.nvidia.com,resources=nodemaintenances,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;update;create
+//+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;create;update;delete
+//+kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,verbs=use,resourceNames=privileged
 
 // Reconcile reconciles the NicConfigurationTemplate object
 func (r *NicConfigurationTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -170,6 +176,12 @@ func (r *NicConfigurationTemplateReconciler) Reconcile(ctx context.Context, req 
 			log.Log.Error(err, "failed to update template status", "template", template.Name)
 			return ctrl.Result{}, err
 		}
+	}
+
+	err = syncdaemon.SyncConfigDaemonObjs(ctx, r.Client, r.Scheme, os.Getenv("NAMESPACE"))
+	if err != nil {
+		log.Log.Error(err, "failed to sync ds")
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
