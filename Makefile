@@ -335,6 +335,7 @@ endif
 bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
 	$(OPERATOR_SDK) generate kustomize manifests -q
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(OPERATOR_IMAGE_TAG)
+	cd config/daemon && $(KUSTOMIZE) edit set configmap config --from-literal=configDaemonImage=$(CONFIG_DAEMON_IMAGE_TAG) --from-literal=releaseVersion=${VERSION}
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
 	$(OPERATOR_SDK) bundle validate ./bundle
 
@@ -344,7 +345,7 @@ bundle-build: ## Build the bundle image.
 
 .PHONY: bundle-push
 bundle-push: ## Push the bundle image.
-	$(MAKE) docker-push IMG=$(BUNDLE_IMG)
+	$(CONTAINER_TOOL) push $(BUNDLE_IMG)
 
 .PHONY: opm
 OPM = $(LOCALBIN)/opm
