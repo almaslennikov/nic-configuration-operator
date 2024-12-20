@@ -71,7 +71,11 @@ spec:
             - "ALL"
         env:
           - name: LOG_LEVEL
-            value: debug
+            value: info
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         livenessProbe:
           httpGet:
             path: /healthz
@@ -84,8 +88,6 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
         resources:
           limits:
             cpu: 500m
