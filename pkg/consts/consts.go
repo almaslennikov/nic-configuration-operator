@@ -31,10 +31,16 @@ const (
 	UpdateSuccessfulReason              = "UpdateSuccessful"
 	SpecValidationFailed                = "SpecValidationFailed"
 	FirmwareError                       = "FirmwareError"
+	PendingFirmwareUpdateReason         = "PendingFirmwareUpdate"
 
-	DeviceConfigSpecEmptyReason = "DeviceConfigSpecEmpty"
-	DeviceFwMatchReason         = "DeviceFirmwareConfigMatch"
-	DeviceFwMismatchReason      = "DeviceFirmwareConfigMismatch"
+	FirmwareUpdateInProgressCondition = "FirmwareUpdateInProgress"
+	FirmwareValidationStartedReason   = "FirmwareValidationStarted"
+	FirmwareSourceNotReadyReason      = "FirmwareSourceNotReadyReason"
+
+	DeviceConfigSpecEmptyReason   = "DeviceConfigSpecEmpty"
+	DeviceFwMatchReason           = "DeviceFirmwareConfigMatch"
+	DeviceFwMismatchReason        = "DeviceFirmwareConfigMismatch"
+	DeviceFirmwareSpecEmptyReason = "DeviceFirmwareSpecEmpty"
 
 	PartNumberPrefix      = "pn:"
 	SerialNumberPrefix    = "sn:"
