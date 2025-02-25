@@ -19,6 +19,7 @@ package firmware
 import (
 	"archive/zip"
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -33,7 +34,7 @@ import (
 	"github.com/Mellanox/nic-configuration-operator/pkg/consts"
 )
 
-type ProvisioningUtils interface {
+type FirmwareUtils interface {
 	// DownloadFile downloads the file under url and places it locally under destPath
 	DownloadFile(url, destPath string) error
 	// UnzipFiles extract files from the zip archive to destDir
@@ -43,6 +44,9 @@ type ProvisioningUtils interface {
 	GetFirmwareVersionAndPSID(firmwareBinaryPath string) (string, string, error)
 	// CleanupDirectory deletes any file inside a root directory except for allowedSet. Empty directories are cleaned up as well at the end
 	CleanupDirectory(root string, allowedSet map[string]struct{}) error
+	// BurnNicFirmware burns the requested firmware on the requested device
+	// Operation can be long, require context to be able to terminate by timeout
+	BurnNicFirmware(ctx context.Context, pciAddress, fwPath string) error
 }
 
 type utils struct {
@@ -51,6 +55,8 @@ type utils struct {
 
 // DownloadFile downloads the file under url and places it locally under destPath
 func (u utils) DownloadFile(url, destPath string) error {
+	log.Log.V(2).Info("FirmwareUtils.DownloadFile()", "url", url, "destPath", destPath)
+
 	resp, err := http.Get(url)
 	if err != nil {
 		return fmt.Errorf("could not download file: %w", err)
@@ -87,6 +93,8 @@ func (u utils) DownloadFile(url, destPath string) error {
 // UnzipFiles extract files from the zip archive to destDir
 // Returns a list of extracted files, error if occurred
 func (u utils) UnzipFiles(zipPath, destDir string) ([]string, error) {
+	log.Log.V(2).Info("FirmwareUtils.UnzipFiles()", "zipPath", zipPath, "destDir", destDir)
+
 	extractedFiles := []string{}
 
 	zipReader, err := zip.OpenReader(zipPath)
@@ -147,7 +155,7 @@ func extractFile(zf *zip.File, destPath string) error {
 
 // GetFirmwareVersionAndPSID retrieves the version and PSID from the firmware binary
 func (u utils) GetFirmwareVersionAndPSID(firmwareBinaryPath string) (string, string, error) {
-	log.Log.Info("FirmwareUtils.GetFirmwareVersionAndPSID()", "firmwareBinaryPath", firmwareBinaryPath)
+	log.Log.V(2).Info("FirmwareUtils.GetFirmwareVersionAndPSID()", "firmwareBinaryPath", firmwareBinaryPath)
 	cmd := u.execInterface.Command("mstflint", "-i", firmwareBinaryPath, "q")
 	output, err := cmd.Output()
 	if err != nil {
@@ -186,6 +194,7 @@ func (u utils) GetFirmwareVersionAndPSID(firmwareBinaryPath string) (string, str
 
 // CleanupDirectory deletes any file inside a root directory except for allowedSet. Empty directories are cleaned up as well at the end
 func (u utils) CleanupDirectory(root string, allowedSet map[string]struct{}) error {
+	log.Log.V(2).Info("FirmwareUtils.CleanupDirectory()", "root", root, "allowedSet", allowedSet)
 	log.Log.Info("Cleaning up cache directory", "cacheDir", root)
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
@@ -260,6 +269,74 @@ func (u utils) removeEmptyDirs(dir string) error {
 	return nil
 }
 
-func newFirmwareUtils() ProvisioningUtils {
+// BurnNicFirmware burns the requested firmware on the requested device
+// Operation can be long, require context to be able to terminate by timeout
+func (u utils) BurnNicFirmware(ctx context.Context, pciAddress, fwPath string) error {
+	log.Log.V(2).Info("FirmwareUtils.BurnNicFirmware()", "pciAddress", pciAddress, "fwPath", fwPath)
+
+	cmd := u.execInterface.CommandContext(ctx, "mstflint", "--device", pciAddress, "--image", fwPath, "--yes", "burn")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Log.Error(err, "BurnNicFirmware(): Failed to run mstflint", "output", output)
+		return err
+	}
+	return nil
+}
+
+func newFirmwareUtils() FirmwareUtils {
 	return utils{execInterface: execUtils.New()}
+}
+
+// createDirIfNotExists checks if dir exists and creates it if not
+func createDirIfNotExists(path string) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		log.Log.V(2).Info("directory doesn't exist, creating it", "path", path)
+
+		err := os.MkdirAll(path, 0755)
+		if err != nil {
+			log.Log.Error(err, "failed to create directory")
+			return err
+		}
+	}
+
+	return nil
+}
+
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("opening source file: %w", err)
+	}
+	defer func() {
+		cerr := in.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}()
+
+	// Create the destination file for writing.
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("creating destination file: %w", err)
+	}
+	// Ensure the file is closed and capture any error.
+	defer func() {
+		cerr := out.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}()
+
+	// Copy the file content from in to out.
+	if _, err = io.Copy(out, in); err != nil {
+		return fmt.Errorf("copying file: %w", err)
+	}
+
+	// Optionally sync to flush write buffers.
+	if err = out.Sync(); err != nil {
+		return fmt.Errorf("syncing file: %w", err)
+	}
+
+	return err
 }

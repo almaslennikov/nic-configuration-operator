@@ -35,7 +35,7 @@ import (
 
 var _ = Describe("utils", func() {
 	var (
-		testedUtils ProvisioningUtils
+		testedUtils FirmwareUtils
 		tmpDir      string
 	)
 
@@ -252,9 +252,81 @@ var _ = Describe("utils", func() {
 			Expect(filepath.Join(rootDir, "subdir", "keepB.bin")).To(BeARegularFile())
 		})
 	})
+
+	Describe("standalone util functions", func() {
+		BeforeEach(func() {
+			var err error
+			tmpDir, err = os.MkdirTemp("", "fileutils_test")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			_ = os.RemoveAll(tmpDir)
+		})
+
+		Describe("createDirIfNotExists", func() {
+			It("should create the directory if it does not exist", func() {
+				newDir := filepath.Join(tmpDir, "newdir")
+				err := createDirIfNotExists(newDir)
+				Expect(err).NotTo(HaveOccurred())
+
+				info, err := os.Stat(newDir)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(info.IsDir()).To(BeTrue())
+			})
+
+			It("should not return an error if the directory already exists", func() {
+				existingDir := filepath.Join(tmpDir, "existing")
+				err := os.MkdirAll(existingDir, 0755)
+				Expect(err).NotTo(HaveOccurred())
+
+				err = createDirIfNotExists(existingDir)
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		Describe("copyFile", func() {
+			It("should copy file content from source to destination", func() {
+				src := filepath.Join(tmpDir, "src.txt")
+				dst := filepath.Join(tmpDir, "dst.txt")
+				content := "Hello, world!"
+
+				err := os.WriteFile(src, []byte(content), 0644)
+				Expect(err).NotTo(HaveOccurred())
+
+				err = copyFile(src, dst)
+				Expect(err).NotTo(HaveOccurred())
+
+				data, err := os.ReadFile(dst)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(data)).To(Equal(content))
+			})
+
+			It("should return an error if the source file does not exist", func() {
+				src := filepath.Join(tmpDir, "nonexistent.txt")
+				dst := filepath.Join(tmpDir, "dst.txt")
+
+				err := copyFile(src, dst)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("opening source file"))
+			})
+
+			It("should return an error if the destination file cannot be created", func() {
+				src := filepath.Join(tmpDir, "src.txt")
+				err := os.WriteFile(src, []byte("content"), 0644)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Destination in a subdirectory that does not exist
+				dst := filepath.Join(tmpDir, "nonexistent", "dst.txt")
+				err = copyFile(src, dst)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("creating destination file"))
+			})
+		})
+	})
 })
 
-func newTestFirmwareUtils() ProvisioningUtils {
+func newTestFirmwareUtils() FirmwareUtils {
 	return &utils{}
 }
 

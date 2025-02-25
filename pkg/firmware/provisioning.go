@@ -43,7 +43,7 @@ type FirmwareProvisioner interface {
 type firmwareProvisioner struct {
 	cacheRootDir string
 
-	utils ProvisioningUtils
+	utils FirmwareUtils
 }
 
 // IsFWStorageAvailable checks if the cache storage exists in the pod.
@@ -157,14 +157,9 @@ func (f firmwareProvisioner) VerifyCachedBinaries(cacheName string, urls []strin
 func (f firmwareProvisioner) DownloadAndUnzipFirmwareArchives(cacheName string, urls []string, cleanupArchives bool) error {
 	firmwareBinariesDir := path.Join(f.cacheRootDir, cacheName, consts.NicFirmwareBinariesFolder)
 
-	if _, err := os.Stat(firmwareBinariesDir); os.IsNotExist(err) {
-		log.Log.V(2).Info("Cache directory doesn't exist, creating it", "cacheDir", firmwareBinariesDir)
-
-		err := os.MkdirAll(firmwareBinariesDir, 0755)
-		if err != nil {
-			log.Log.Error(err, "failed to create new cache in nic fw storage", "cacheName", cacheName)
-			return err
-		}
+	if err := createDirIfNotExists(firmwareBinariesDir); err != nil {
+		log.Log.Error(err, "failed to create new cache in nic fw storage", "cacheName", cacheName)
+		return err
 	}
 
 	log.Log.Info("Downloading firmware zip archives", "cacheDir", firmwareBinariesDir)
@@ -279,12 +274,9 @@ func (f firmwareProvisioner) AddFirmwareBinariesToCacheByMetadata(cacheName stri
 
 		targetDir := path.Join(firmwareBinariesDir, version, psid)
 
-		if _, err := os.Stat(targetDir); os.IsNotExist(err) {
-			err := os.MkdirAll(targetDir, 0755)
-			if err != nil {
-				log.Log.Error(err, "failed to create directory in nic fw storage", "cacheName", cacheName, "path", targetDir)
-				return err
-			}
+		if err := createDirIfNotExists(targetDir); err != nil {
+			log.Log.Error(err, "failed to create directory in nic fw storage", "cacheName", cacheName, "path", targetDir)
+			return err
 		} else {
 			entries, err := os.ReadDir(targetDir)
 			if err != nil {
