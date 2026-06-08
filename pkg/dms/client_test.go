@@ -17,9 +17,7 @@ package dms
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,741 +30,208 @@ import (
 	"github.com/Mellanox/nic-configuration-operator/pkg/types"
 )
 
-// Test helpers and constants
 const (
-	testNetworkInterface = "enp3s0f0np0"
-	testPCI              = "0000:00:00.0"
-	testPFC              = "0,0,0,1,0,0,0,0"
-	testTrustMode        = consts.TrustModeDscp
-	testToS              = 96
+	testPCI       = "0000:00:00.0"
+	testBindAddr  = "localhost:9339"
+	testTarget    = "pci/0000:00:00.0"
+	bf3DeviceType = consts.BlueField3DeviceID
 )
 
-// createFakeCmd creates a fake exec Command with specified output and error
+// createFakeCmd creates a fake exec Command with specified output and error.
 func createFakeCmd(output []byte, err error) *execTesting.FakeCmd {
-	action := func() ([]byte, []byte, error) {
-		return output, nil, err
-	}
+	action := func() ([]byte, []byte, error) { return output, nil, err }
 	return &execTesting.FakeCmd{
 		OutputScript:         []execTesting.FakeAction{action},
 		CombinedOutputScript: []execTesting.FakeAction{action},
 	}
 }
 
-// helpers to build expected paths
-
-//nolint:unparam
-func createTrustModePath(netInterface string) string {
-	return "/interfaces/interface[name=" + netInterface + "]/nvidia/qos/config/trust-mode"
+// capturingExec records every command (cmd + args) and returns canned output/err. It is
+// repeatable (unlike FakeExec's fixed CommandScript), so it handles N invocations.
+type capturingExec struct {
+	exec.Interface
+	captured *[][]string
+	output   []byte
+	err      error
 }
 
-//nolint:unparam
-func createPFCPath(netInterface string) string {
-	return "/interfaces/interface[name=" + netInterface + "]/nvidia/qos/config/pfc"
+func (e *capturingExec) record(cmd string, args ...string) exec.Cmd {
+	*e.captured = append(*e.captured, append([]string{cmd}, args...))
+	return createFakeCmd(e.output, e.err)
+}
+func (e *capturingExec) Command(cmd string, args ...string) exec.Cmd { return e.record(cmd, args...) }
+func (e *capturingExec) CommandContext(_ context.Context, cmd string, args ...string) exec.Cmd {
+	return e.record(cmd, args...)
 }
 
-//nolint:unparam
-func createToSPath(netInterface string) string {
-	return "/interfaces/interface[name=" + netInterface + "]/nvidia/roce/config/tos"
-}
-
-// createTrustModeSetPath returns the path payload used for setting trust mode
-//
-//nolint:unparam
-func createTrustModeSetPath(netInterface, value string) string {
-	return "/interfaces/interface[name=" + netInterface + "]/nvidia/qos/config/trust-mode:::string:::" + value
-}
-
-//nolint:unparam
-func createPFCSetPath(netInterface, value string) string {
-	return "/interfaces/interface[name=" + netInterface + "]/nvidia/qos/config/pfc:::string:::" + value
-}
-
-//nolint:unparam
-func createToSSetPath(netInterface string, value int) string {
-	return fmt.Sprintf("/interfaces/interface[name=%s]/nvidia/roce/config/tos:::int:::%d", netInterface, value)
-}
-
-// makeGetOutput returns JSON output for RunGetPathCommand
-// displayPath is the Path field value; valueKeyPath is the key expected by DMS client (original unfiltered path)
-func makeGetOutput(displayPath, valueKeyPath, value string) []byte {
-	t := []struct {
-		Source    string `json:"source"`
-		Timestamp int64  `json:"timestamp"`
-		Time      string `json:"time"`
-		Updates   []struct {
-			Path   string            `json:"Path"`
-			Values map[string]string `json:"values"`
-		} `json:"updates"`
-	}{
-		{
-			Source:    "test",
-			Timestamp: 0,
-			Time:      "",
-			Updates: []struct {
-				Path   string            `json:"Path"`
-				Values map[string]string `json:"values"`
-			}{
-				{Path: displayPath, Values: map[string]string{valueKeyPath[1:]: value}},
-			},
-		},
+func newTestClient(captured *[][]string, output []byte, err error, deviceType string) *dmsClient {
+	return &dmsClient{
+		device:        v1alpha1.NicDeviceStatus{SerialNumber: "SN-1", Type: deviceType, Ports: []v1alpha1.NicDevicePortSpec{{PCI: testPCI}}},
+		targetPCI:     testPCI,
+		bindAddress:   testBindAddr,
+		authParams:    []string{"--insecure"},
+		execInterface: &capturingExec{captured: captured, output: output, err: err},
 	}
-	b, _ := json.Marshal(t)
-	return b
 }
 
-var _ = Describe("DMSClient", func() {
-	var (
-		client   *dmsClient
-		device   v1alpha1.NicDeviceStatus
-		fakeExec *execTesting.FakeExec
-	)
+// joined returns the captured command at index i as a single space-joined string.
+func joined(captured [][]string, i int) string {
+	return strings.Join(captured[i], " ")
+}
 
-	BeforeEach(func() {
-		device = v1alpha1.NicDeviceStatus{
-			SerialNumber: "test-serial",
-			Ports: []v1alpha1.NicDevicePortSpec{
-				{
-					PCI:              testPCI,
-					NetworkInterface: testNetworkInterface,
-				},
-			},
-		}
-		fakeExec = &execTesting.FakeExec{}
-		client = &dmsClient{
-			device:        device,
-			targetPCI:     testPCI,
-			bindAddress:   ":9339",
-			authParams:    []string{"--insecure"},
-			execInterface: fakeExec,
-		}
-	})
+var _ = Describe("DMSClient (dms-cli)", func() {
+	Describe("SetParameters", func() {
+		It("renders one dms-cli invocation per op with sorted leaf=value assignments and pci/ target", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte(""), nil, "1023")
 
-	// verifyTargetFlag checks that --target PCI is present in command args
-	verifyTargetFlag := func(args []string) {
-		found := false
-		for i, arg := range args {
-			if arg == "--target" && i+1 < len(args) && args[i+1] == testPCI {
-				found = true
-				break
-			}
-		}
-		Expect(found).To(BeTrue(), "Expected --target %s in args: %v", testPCI, args)
-	}
-
-	Describe("GetQoSSettings", func() {
-		Context("with successful commands", func() {
-			BeforeEach(func() {
-				fakeTrustCmd := createFakeCmd(makeGetOutput(createTrustModePath(testNetworkInterface), QoSTrustModePath, "dscp"), nil)
-				fakePFCCmd := createFakeCmd(makeGetOutput(createPFCPath(testNetworkInterface), QoSPFCPath, "00001000"), nil)
-				fakeToSCmd := createFakeCmd(makeGetOutput(createToSPath(testNetworkInterface), ToSPath, fmt.Sprintf("%d", testToS)), nil)
-
-				cmdAction := func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					path := args[len(args)-1]
-					if path == createTrustModePath(testNetworkInterface) {
-						return fakeTrustCmd
-					}
-					if path == createPFCPath(testNetworkInterface) {
-						return fakePFCCmd
-					}
-					return fakeToSCmd
-				}
-
-				fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction, cmdAction}
+			err := client.SetParameters([]types.DMSConfigOp{
+				{Path: "/nvidia/roce", Values: map[string]any{"adaptive-routing": true, "cc-steering-ext": "enabled"}},
 			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(captured).To(HaveLen(1))
+			Expect(joined(captured, 0)).To(Equal(
+				dmsClientPath + " -a localhost:9339 --insecure -t pci/0000:00:00.0 --timeout 300s " +
+					"/nvidia/roce adaptive-routing=true cc-steering-ext=enabled"))
+		})
 
-			It("should return correct QoS spec", func() {
-				spec, err := client.GetQoSSettings(testNetworkInterface)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(spec).NotTo(BeNil())
-				Expect(spec.Trust).To(Equal("dscp"))
-				Expect(spec.PFC).To(Equal("0,0,0,0,1,0,0,0"))
-				Expect(spec.ToS).To(Equal(testToS))
+		It("renders list and int values", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte(""), nil, "1023")
+
+			err := client.SetParameters([]types.DMSConfigOp{
+				{Path: "/nvidia/link/breakout/module/[0]/port/[1]", Values: map[string]any{"lanes": []any{float64(0), float64(1)}}},
+				{Path: "/nvidia/pci", Values: map[string]any{"num-pfs": float64(2)}},
 			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(captured).To(HaveLen(2))
+			Expect(captured[0]).To(ContainElement("lanes=[0,1]"))
+			Expect(captured[1]).To(ContainElement("num-pfs=2"))
 		})
 
-		It("should handle trust mode command error", func() {
-			fakeCmd := createFakeCmd(nil, errors.New("command failed"))
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd { return fakeCmd },
-			}
-
-			spec, err := client.GetQoSSettings(testNetworkInterface)
+		It("propagates set errors", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte("boom"), errors.New("exit 1"), "1023")
+			err := client.SetParameters([]types.DMSConfigOp{{Path: "/nvidia/roce", Values: map[string]any{"x": true}}})
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to get trust mode"))
-			Expect(spec).To(BeNil())
-		})
-
-		It("should handle PFC command error", func() {
-			fakeTrustCmd := createFakeCmd(makeGetOutput(createTrustModePath(testNetworkInterface), QoSTrustModePath, "dscp"), nil)
-			fakePFCCmd := createFakeCmd(nil, errors.New("command failed"))
-
-			cmdAction := func(cmd string, args ...string) exec.Cmd {
-				path := args[len(args)-1]
-				if path == createTrustModePath(testNetworkInterface) {
-					return fakeTrustCmd
-				}
-				return fakePFCCmd
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction}
-
-			spec, err := client.GetQoSSettings(testNetworkInterface)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to get PFC configuration"))
-			Expect(spec).To(BeNil())
-		})
-
-		It("should handle ToS command error", func() {
-			fakeTrustCmd := createFakeCmd(makeGetOutput(createTrustModePath(testNetworkInterface), QoSTrustModePath, "dscp"), nil)
-			fakePFCCmd := createFakeCmd(makeGetOutput(createPFCPath(testNetworkInterface), QoSPFCPath, "00001000"), nil)
-			fakeToSCmd := createFakeCmd(nil, errors.New("command failed"))
-
-			cmdAction := func(cmd string, args ...string) exec.Cmd {
-				path := args[len(args)-1]
-				if path == createTrustModePath(testNetworkInterface) {
-					return fakeTrustCmd
-				}
-				if path == createPFCPath(testNetworkInterface) {
-					return fakePFCCmd
-				}
-				return fakeToSCmd
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction, cmdAction}
-
-			spec, err := client.GetQoSSettings(testNetworkInterface)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to get ToS configuration"))
-			Expect(spec).To(BeNil())
-		})
-
-		It("should handle ToS parse error", func() {
-			fakeTrustCmd := createFakeCmd(makeGetOutput(createTrustModePath(testNetworkInterface), QoSTrustModePath, "dscp"), nil)
-			fakePFCCmd := createFakeCmd(makeGetOutput(createPFCPath(testNetworkInterface), QoSPFCPath, "00001000"), nil)
-			fakeToSCmd := createFakeCmd(makeGetOutput(createToSPath(testNetworkInterface), ToSPath, "not-an-int"), nil)
-
-			cmdAction := func(cmd string, args ...string) exec.Cmd {
-				path := args[len(args)-1]
-				if path == createTrustModePath(testNetworkInterface) {
-					return fakeTrustCmd
-				}
-				if path == createPFCPath(testNetworkInterface) {
-					return fakePFCCmd
-				}
-				return fakeToSCmd
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction, cmdAction}
-
-			spec, err := client.GetQoSSettings(testNetworkInterface)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to convert ToS to int"))
-			Expect(spec).To(BeNil())
-		})
-	})
-
-	Describe("SetQoSSettings", func() {
-		Context("with successful commands", func() {
-			BeforeEach(func() {
-				fakeTrustCmd := createFakeCmd(nil, nil)
-				fakePFCCmd := createFakeCmd(nil, nil)
-				fakeToSCmd := createFakeCmd(nil, nil)
-
-				cmdAction := func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					payload := args[len(args)-1]
-					if strings.Contains(payload, createTrustModeSetPath(testNetworkInterface, "dscp")) {
-						return fakeTrustCmd
-					}
-					if strings.Contains(payload, createPFCSetPath(testNetworkInterface, "00010000")) {
-						return fakePFCCmd
-					}
-					if strings.Contains(payload, createToSSetPath(testNetworkInterface, testToS)) {
-						return fakeToSCmd
-					}
-					return createFakeCmd(nil, nil)
-				}
-
-				fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction, cmdAction}
-			})
-
-			It("should successfully set QoS settings", func() {
-				err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: testTrustMode, PFC: testPFC, ToS: testToS})
-				Expect(err).NotTo(HaveOccurred())
-			})
-		})
-
-		It("should handle trust mode command error", func() {
-			fakeCmd := createFakeCmd(nil, errors.New("command failed"))
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd { return fakeCmd },
-			}
-
-			err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: testTrustMode, PFC: testPFC, ToS: testToS})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to set trust mode"))
-		})
-
-		It("should handle PFC command error", func() {
-			fakeTrustCmd := createFakeCmd(nil, nil)
-			fakePFCCmd := createFakeCmd(nil, errors.New("command failed"))
-
-			cmdAction := func(cmd string, args ...string) exec.Cmd {
-				payload := args[len(args)-1]
-				if strings.Contains(payload, createTrustModeSetPath(testNetworkInterface, "dscp")) {
-					return fakeTrustCmd
-				}
-				return fakePFCCmd
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction}
-
-			err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: testTrustMode, PFC: testPFC, ToS: testToS})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to set PFC configuration"))
-		})
-
-		It("should handle ToS command error", func() {
-			fakeTrustCmd := createFakeCmd(nil, nil)
-			fakePFCCmd := createFakeCmd(nil, nil)
-			fakeToSCmd := createFakeCmd(nil, errors.New("command failed"))
-
-			cmdAction := func(cmd string, args ...string) exec.Cmd {
-				payload := args[len(args)-1]
-				if strings.Contains(payload, createTrustModeSetPath(testNetworkInterface, "dscp")) {
-					return fakeTrustCmd
-				}
-				if strings.Contains(payload, createPFCSetPath(testNetworkInterface, "00010000")) {
-					return fakePFCCmd
-				}
-				if strings.Contains(payload, createToSSetPath(testNetworkInterface, testToS)) {
-					return fakeToSCmd
-				}
-				return fakeToSCmd
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction, cmdAction}
-
-			err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: testTrustMode, PFC: testPFC, ToS: testToS})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to set ToS configuration"))
-		})
-
-		It("should return error for invalid trust mode", func() {
-			err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: "invalid", PFC: testPFC, ToS: testToS})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("invalid trust mode"))
 		})
 	})
 
 	Describe("GetParameters", func() {
-		It("returns value for simple path", func() {
-			param := types.ConfigurationParameter{DMSPath: "/nvidia/mode/config/mode"}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					path := args[len(args)-1]
-					Expect(path).To(Equal(param.DMSPath))
-					return createFakeCmd(makeGetOutput(param.DMSPath, param.DMSPath, "NIC"), nil)
-				},
-			}
+		It("reads each leaf with --plain and keys results by path/leaf", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte("adaptive-routing: true"), nil, "1023")
 
-			vals, err := client.GetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vals[param.DMSPath]).To(Equal("NIC"))
-		})
-
-		It("returns value for interface path with final unfiltered get", func() {
-			param := types.ConfigurationParameter{DMSPath: "/interfaces/interface/nvidia/qos/config/trust-mode"}
-
-			filtered := createTrustModePath(testNetworkInterface)
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				// filtered get per port
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					return createFakeCmd(makeGetOutput(filtered, param.DMSPath, "dscp"), nil)
-				},
-				// final unfiltered get
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					return createFakeCmd(makeGetOutput(param.DMSPath, param.DMSPath, "dscp"), nil)
-				},
-			}
-
-			vals, err := client.GetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vals[param.DMSPath]).To(Equal("dscp"))
-		})
-
-		It("fails on mismatch across priorities", func() {
-			param := types.ConfigurationParameter{DMSPath: "/interfaces/interface/nvidia/cc/config/priority/np_enabled"}
-			filtered := "/interfaces/interface[name=" + testNetworkInterface + "]/nvidia/cc/config/priority/np_enabled"
-
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					return createFakeCmd(makeGetOutput(filtered, param.DMSPath, "1"), nil)
-				},
-				func(cmd string, args ...string) exec.Cmd {
-					return createFakeCmd(makeGetOutput(filtered, param.DMSPath, "0"), nil)
-				},
-			}
-
-			_, err := client.GetParameters([]types.ConfigurationParameter{param})
-			Expect(err).To(HaveOccurred())
-			Expect(types.IsValuesDoNotMatchError(err)).To(BeTrue())
-		})
-
-		It("returns value for interface+priority path across all IDs", func() {
-			param := types.ConfigurationParameter{DMSPath: "/interfaces/interface/nvidia/cc/config/priority/np_enabled"}
-			expectedFiltered := make([]string, 0, 8)
-			for id := 0; id < 8; id++ {
-				expectedFiltered = append(expectedFiltered, fmt.Sprintf("/interfaces/interface[name=%s]/nvidia/cc/config/priority[id=%d]/np_enabled", testNetworkInterface, id))
-			}
-
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{}
-			// eight filtered gets
-			for i := 0; i < 8; i++ {
-				path := expectedFiltered[i]
-				fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					reqPath := args[len(args)-1]
-					Expect(reqPath).To(Equal(path))
-					return createFakeCmd(makeGetOutput(path, param.DMSPath, "1"), nil)
-				})
-			}
-			// final unfiltered get
-			fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-				verifyTargetFlag(args)
-				reqPath := args[len(args)-1]
-				Expect(reqPath).To(Equal(param.DMSPath))
-				return createFakeCmd(makeGetOutput(param.DMSPath, param.DMSPath, "1"), nil)
+			values, err := client.GetParameters([]types.DMSConfigOp{
+				{Path: "/nvidia/roce", Values: map[string]any{"adaptive-routing": true}},
 			})
-
-			vals, err := client.GetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vals[param.DMSPath]).To(Equal("1"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(values).To(HaveKeyWithValue("/nvidia/roce/adaptive-routing", "true"))
+			Expect(joined(captured, 0)).To(ContainSubstring("-t pci/0000:00:00.0"))
+			Expect(captured[0]).To(ContainElement("--plain"))
+			Expect(captured[0]).To(ContainElement("/nvidia/roce"))
+			Expect(captured[0]).To(ContainElement("adaptive-routing"))
 		})
 	})
 
-	Describe("SetParameters", func() {
-		// collectUpdatePayloads extracts all --update values from args
-		collectUpdatePayloads := func(args []string) []string {
-			var payloads []string
-			for i, arg := range args {
-				if arg == "--update" && i+1 < len(args) {
-					payloads = append(payloads, args[i+1])
-				}
-			}
-			return payloads
-		}
+	Describe("OpsApplied", func() {
+		ops := []types.DMSConfigOp{{Path: "/nvidia/link/admin", Values: map[string]any{"admin-status": "up"}}}
 
-		It("sets value for simple path in single command", func() {
-			param := types.ConfigurationParameter{DMSPath: "/nvidia/mode/config/mode", Value: "NIC", ValueType: ValueTypeString}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					payloads := collectUpdatePayloads(args)
-					Expect(payloads).To(HaveLen(1))
-					Expect(payloads[0]).To(Equal("/nvidia/mode/config/mode:::string:::NIC"))
-					return createFakeCmd(nil, nil)
-				},
-			}
-			err := client.SetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
+		It("returns true when the current value matches the desired", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte("admin-status: up"), nil, "1023")
+			ok, err := OpsApplied(client, ops)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeTrue())
 		})
 
-		It("sets value per interface in single command", func() {
-			param := types.ConfigurationParameter{DMSPath: "/interfaces/interface/nvidia/qos/config/trust-mode", Value: "dscp", ValueType: ValueTypeString}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					payloads := collectUpdatePayloads(args)
-					Expect(payloads).To(HaveLen(1))
-					Expect(payloads[0]).To(Equal(createTrustModeSetPath(testNetworkInterface, "dscp")))
-					return createFakeCmd(nil, nil)
-				},
-			}
-			err := client.SetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
+		It("returns false when the current value differs", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte("admin-status: down"), nil, "1023")
+			ok, err := OpsApplied(client, ops)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeFalse())
 		})
 
-		It("sets value per interface+priority across all IDs in single command", func() {
-			param := types.ConfigurationParameter{DMSPath: "/interfaces/interface/nvidia/cc/config/priority/np_enabled", Value: "1", ValueType: ValueTypeBool}
-			expectedPayloads := make([]string, 0, 8)
-			for id := 0; id < 8; id++ {
-				expectedPayloads = append(expectedPayloads, fmt.Sprintf("/interfaces/interface[name=%s]/nvidia/cc/config/priority[id=%d]/np_enabled:::bool:::1", testNetworkInterface, id))
-			}
-
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					payloads := collectUpdatePayloads(args)
-					Expect(payloads).To(HaveLen(8))
-					for i, expected := range expectedPayloads {
-						Expect(payloads[i]).To(Equal(expected))
-					}
-					return createFakeCmd(nil, nil)
-				},
-			}
-
-			err := client.SetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("batches mixed params into single command", func() {
-			params := []types.ConfigurationParameter{
-				{DMSPath: "/nvidia/mode/config/mode", Value: "NIC", ValueType: ValueTypeString},
-				{DMSPath: "/interfaces/interface/nvidia/qos/config/trust-mode", Value: "dscp", ValueType: ValueTypeString},
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					verifyTargetFlag(args)
-					payloads := collectUpdatePayloads(args)
-					Expect(payloads).To(HaveLen(2))
-					Expect(payloads[0]).To(Equal("/nvidia/mode/config/mode:::string:::NIC"))
-					Expect(payloads[1]).To(Equal(createTrustModeSetPath(testNetworkInterface, "dscp")))
-					return createFakeCmd(nil, nil)
-				},
-			}
-			err := client.SetParameters(params)
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("returns nil for empty params without executing command", func() {
-			err := client.SetParameters([]types.ConfigurationParameter{})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(fakeExec.CommandCalls).To(Equal(0))
-		})
-
-		It("returns error when batch command fails", func() {
-			param := types.ConfigurationParameter{DMSPath: "/nvidia/mode/config/mode", Value: "NIC", ValueType: ValueTypeString}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					return createFakeCmd(nil, errors.New("command failed"))
-				},
-			}
-			err := client.SetParameters([]types.ConfigurationParameter{param})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to set parameters"))
-		})
-
-		It("ignores error when all params have IgnoreError set", func() {
-			params := []types.ConfigurationParameter{
-				{DMSPath: "/nvidia/mode/config/mode", Value: "NIC", ValueType: ValueTypeString, IgnoreError: true},
-				{DMSPath: "/interfaces/interface/nvidia/qos/config/trust-mode", Value: "dscp", ValueType: ValueTypeString, IgnoreError: true},
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					return createFakeCmd(nil, errors.New("command failed"))
-				},
-			}
-			err := client.SetParameters(params)
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("returns error when command fails and some params do not have IgnoreError", func() {
-			params := []types.ConfigurationParameter{
-				{DMSPath: "/nvidia/mode/config/mode", Value: "NIC", ValueType: ValueTypeString, IgnoreError: true},
-				{DMSPath: "/interfaces/interface/nvidia/qos/config/trust-mode", Value: "dscp", ValueType: ValueTypeString, IgnoreError: false},
-			}
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					return createFakeCmd(nil, errors.New("command failed"))
-				},
-			}
-			err := client.SetParameters(params)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to set parameters"))
+		It("returns true for an empty op set", func() {
+			ok, err := OpsApplied(nil, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeTrue())
 		})
 	})
 
-	Describe("HwplbFirstPortOnly", func() {
-		const (
-			secondNetworkInterface = "enp3s0f1np1"
-			secondPCI              = "0000:00:00.1"
-		)
+	Describe("parsePlainValue", func() {
+		It("extracts the value for the matching leaf", func() {
+			out := "trust-mode: dscp\nenabled-priorities: [3]\nvalue: 96"
+			Expect(parsePlainValue(out, "trust-mode")).To(Equal("dscp"))
+			Expect(parsePlainValue(out, "enabled-priorities")).To(Equal("[3]"))
+			Expect(parsePlainValue(out, "value")).To(Equal("96"))
+		})
+		It("falls back to the last value when no key matches", func() {
+			Expect(parsePlainValue("just-a-value", "missing")).To(Equal("just-a-value"))
+		})
+	})
 
-		var multiPortClient *dmsClient
+	Describe("PFC mask <-> enabled-priorities", func() {
+		It("round-trips", func() {
+			Expect(pfcMaskToPriorities("0,0,0,1,0,0,0,0")).To(Equal("[3]"))
+			Expect(pfcMaskToPriorities("00010000")).To(Equal("[3]"))
+			Expect(prioritiesToPFCMask("[3]")).To(Equal("0,0,0,1,0,0,0,0"))
+			Expect(prioritiesToPFCMask("[]")).To(Equal("0,0,0,0,0,0,0,0"))
+		})
+	})
 
-		BeforeEach(func() {
-			multiPortDevice := v1alpha1.NicDeviceStatus{
-				SerialNumber: "test-serial",
-				Ports: []v1alpha1.NicDevicePortSpec{
-					{PCI: testPCI, NetworkInterface: testNetworkInterface},
-					{PCI: secondPCI, NetworkInterface: secondNetworkInterface},
-				},
-			}
-			multiPortClient = &dmsClient{
-				device:        multiPortDevice,
-				targetPCI:     testPCI,
-				bindAddress:   ":9339",
-				authParams:    []string{"--insecure"},
-				execInterface: fakeExec,
-			}
+	Describe("SetQoSSettings", func() {
+		It("sets trust, PFC and ToS on the flat target-based paths", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte(""), nil, "1023")
+
+			err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: consts.TrustModeDscp, PFC: "0,0,0,1,0,0,0,0", ToS: 96})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(captured).To(HaveLen(3))
+			Expect(joined(captured, 0)).To(HaveSuffix("/nvidia/qos trust-mode=dscp"))
+			Expect(joined(captured, 1)).To(HaveSuffix("/nvidia/qos/pfc enabled-priorities=[3]"))
+			Expect(joined(captured, 2)).To(HaveSuffix("/nvidia/roce/tos value=96"))
 		})
 
-		collectUpdatePayloads := func(args []string) []string {
-			var payloads []string
-			for i, arg := range args {
-				if arg == "--update" && i+1 < len(args) {
-					payloads = append(payloads, args[i+1])
-				}
-			}
-			return payloads
-		}
-
-		It("should iterate only first port when HwplbFirstPortOnly is true", func() {
-			param := types.ConfigurationParameter{
-				DMSPath:            "/interfaces/interface/nvidia/cc/config/priority/rp_enabled",
-				Value:              "1",
-				ValueType:          ValueTypeBool,
-				HwplbFirstPortOnly: true,
-			}
-
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					payloads := collectUpdatePayloads(args)
-					// 8 priorities × 1 port = 8 updates (not 16)
-					Expect(payloads).To(HaveLen(8))
-					for _, p := range payloads {
-						Expect(p).To(ContainSubstring(testNetworkInterface))
-						Expect(p).NotTo(ContainSubstring(secondNetworkInterface))
-					}
-					return createFakeCmd(nil, nil)
-				},
-			}
-
-			err := multiPortClient.SetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
+		It("rejects an invalid trust mode", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte(""), nil, "1023")
+			err := client.SetQoSSettings(&v1alpha1.QosSpec{Trust: "bogus"})
+			Expect(err).To(HaveOccurred())
 		})
+	})
 
-		It("should iterate all ports when HwplbFirstPortOnly is false", func() {
-			param := types.ConfigurationParameter{
-				DMSPath:            "/interfaces/interface/nvidia/cc/config/priority/rp_enabled",
-				Value:              "1",
-				ValueType:          ValueTypeBool,
-				HwplbFirstPortOnly: false,
-			}
+	Describe("GetQoSSettings", func() {
+		It("reads trust, PFC and ToS back", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte("trust-mode: dscp\nenabled-priorities: [3]\nvalue: 96"), nil, "1023")
 
-			fakeExec.CommandScript = []execTesting.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd {
-					payloads := collectUpdatePayloads(args)
-					// 8 priorities × 2 ports = 16 updates
-					Expect(payloads).To(HaveLen(16))
-					return createFakeCmd(nil, nil)
-				},
-			}
-
-			err := multiPortClient.SetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("should query only first port when HwplbFirstPortOnly is true", func() {
-			param := types.ConfigurationParameter{
-				DMSPath:            "/interfaces/interface/nvidia/cc/config/priority/rp_enabled",
-				HwplbFirstPortOnly: true,
-			}
-
-			// 8 priority queries for first port only
-			for i := 0; i < 8; i++ {
-				expectedPath := fmt.Sprintf("/interfaces/interface[name=%s]/nvidia/cc/config/priority[id=%d]/rp_enabled", testNetworkInterface, i)
-				fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-					reqPath := args[len(args)-1]
-					Expect(reqPath).To(Equal(expectedPath))
-					Expect(reqPath).NotTo(ContainSubstring(secondNetworkInterface))
-					return createFakeCmd(makeGetOutput(expectedPath, param.DMSPath, "1"), nil)
-				})
-			}
-
-			vals, err := multiPortClient.GetParameters([]types.ConfigurationParameter{param})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vals[param.DMSPath]).To(Equal("1"))
+			spec, err := client.GetQoSSettings("enp3s0f0np0")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(spec.Trust).To(Equal("dscp"))
+			Expect(spec.PFC).To(Equal("0,0,0,1,0,0,0,0"))
+			Expect(spec.ToS).To(Equal(96))
 		})
 	})
 
 	Describe("InstallBFB", func() {
-		const (
-			testBFBVersion = "24.35.1000"
-			testBFBPath    = "/path/to/firmware.bfb"
-		)
+		It("runs os install then os activate via dms-cli on a BlueField device", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte("ok"), nil, bf3DeviceType)
 
-		Context("on BlueField device", func() {
-			BeforeEach(func() {
-				device.Type = "a2d6" // BlueField2 device ID
-				client.device = device
-			})
-
-			It("should install and activate BFB successfully", func() {
-				fakeInstallCmd := createFakeCmd([]byte("BFB install successful"), nil)
-				fakeActivateCmd := createFakeCmd([]byte("BFB activate successful"), nil)
-
-				callCount := 0
-				cmdAction := func(cmd string, args ...string) exec.Cmd {
-					callCount++
-					Expect(cmd).To(Equal(dmsClientPath))
-					verifyTargetFlag(args)
-
-					if callCount == 1 {
-						Expect(args).To(ContainElement("--insecure"))
-						Expect(args).To(ContainElement("os"))
-						Expect(args).To(ContainElement("install"))
-						Expect(args).To(ContainElement("--version"))
-						Expect(args).To(ContainElement(testBFBVersion))
-						Expect(args).To(ContainElement("--pkg"))
-						Expect(args).To(ContainElement(testBFBPath))
-						return fakeInstallCmd
-					}
-					Expect(args).To(ContainElement("--insecure"))
-					Expect(args).To(ContainElement("os"))
-					Expect(args).To(ContainElement("activate"))
-					Expect(args).To(ContainElement("--version"))
-					Expect(args).To(ContainElement(testBFBVersion))
-					return fakeActivateCmd
-				}
-
-				fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction}
-
-				err := client.InstallBFB(context.Background(), testBFBVersion, testBFBPath)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
-			It("should return error when install command fails", func() {
-				fakeInstallCmd := createFakeCmd(nil, errors.New("install failed"))
-
-				cmdAction := func(cmd string, args ...string) exec.Cmd { return fakeInstallCmd }
-				fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction}
-
-				err := client.InstallBFB(context.Background(), testBFBVersion, testBFBPath)
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("install failed"))
-			})
-
-			It("should return error when activate command fails", func() {
-				fakeInstallCmd := createFakeCmd([]byte("BFB install successful"), nil)
-				fakeActivateCmd := createFakeCmd(nil, errors.New("activate failed"))
-
-				cmdAction := func(cmd string, args ...string) exec.Cmd {
-					if len(args) >= 5 && args[4] == "install" {
-						return fakeInstallCmd
-					}
-					return fakeActivateCmd
-				}
-
-				fakeExec.CommandScript = []execTesting.FakeCommandAction{cmdAction, cmdAction}
-
-				err := client.InstallBFB(context.Background(), testBFBVersion, testBFBPath)
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("activate failed"))
-			})
+			err := client.InstallBFB(context.Background(), "1.2.3", "/tmp/fw.bfb")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(captured).To(HaveLen(2))
+			Expect(captured[0]).To(ContainElements(dmsClientPath, "-t", testTarget, "os", "install", "--version", "1.2.3", "--pkg", "/tmp/fw.bfb"))
+			Expect(captured[1]).To(ContainElements("os", "activate", "--version", "1.2.3"))
 		})
 
-		Context("on non-BlueField device", func() {
-			BeforeEach(func() {
-				device.Type = "cx6"
-				client.device = device
-			})
-
-			It("should return error for non-BlueField device", func() {
-				err := client.InstallBFB(context.Background(), testBFBVersion, testBFBPath)
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("cannot install BFB file on non-BlueField device"))
-			})
+		It("rejects non-BlueField devices", func() {
+			var captured [][]string
+			client := newTestClient(&captured, []byte(""), nil, "1023")
+			err := client.InstallBFB(context.Background(), "1.2.3", "/tmp/fw.bfb")
+			Expect(err).To(HaveOccurred())
 		})
 	})
 })

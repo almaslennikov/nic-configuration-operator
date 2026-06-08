@@ -123,7 +123,7 @@ func main() {
 		}
 	}()
 
-	spectrumXConfigManager := spectrumx.NewSpectrumXConfigManager(dmsServer, nil)
+	spectrumXConfigManager := spectrumx.NewSpectrumXConfigManager(dmsServer, "")
 	configurationManager := configuration.NewConfigurationManager(
 		eventRecorder, dmsServer, nvConfigUtils, spectrumXConfigManager)
 	maintenanceManager := maintenance.New(mgr.GetClient(), hostUtils, nodeName, namespace)

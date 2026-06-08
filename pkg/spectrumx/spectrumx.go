@@ -17,8 +17,6 @@ package spectrumx
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,30 +30,13 @@ import (
 	"github.com/Mellanox/nic-configuration-operator/pkg/types"
 )
 
-// cnpDscpSysfsPathTemplate is the sysfs path template for CNP DSCP.
-// Path: /sys/class/net/<iface>/ecn/roce_np/cnp_dscp
-// This is a var to allow substitution in tests.
-var cnpDscpSysfsPathTemplate = "/sys/class/net/%s/ecn/roce_np/cnp_dscp"
-
-// cnpDscpExpectedValue is the expected value for CNP DSCP
-const cnpDscpExpectedValue = "48"
-
-// mlxreg constants for CC Probe MP mode workaround.
-// Workaround: CC Probe MP mode is not configurable via DMS, so we use mlxreg instead.
-// Remove this workaround once the parameter is added to DMS.
-const ccProbeMPModeRegName = "ROCE_ACCL"
-const ccProbeMPModeFieldName = "cc_probe_mp_mode"
-const ccProbeMPModeFieldSet = "cc_probe_mp_mode=0x1"
-const ccProbeMPModeExpectedValue = "0x00000001"
-
-// mlxregBinary is the path to the mlxreg binary. This is a var to allow substitution in tests.
-var mlxregBinary = "/usr/bin/mlxreg"
-
 type SpectrumXManager interface {
-	// GetBreakoutMlxConfig returns the breakout mlxconfig map for the device based on its SpectrumX spec
-	GetBreakoutMlxConfig(device *v1alpha1.NicDevice) (map[string]string, error)
-	// GetPostBreakoutMlxConfig returns the post-breakout mlxconfig map for the device
-	GetPostBreakoutMlxConfig(device *v1alpha1.NicDevice) (map[string]string, error)
+	// GetPrepareOps renders the device's prepare-stage plan and returns its DMS ops
+	// divided into the breakout (group "breakout") and post-breakout (group
+	// "post-breakout-nvconfig") phases, with rawNvConfig overrides applied. The
+	// ConfigurationManager owns checking/applying them (so they sequence with other
+	// NVConfig options); the breakout phase requires a reboot before post-breakout.
+	GetPrepareOps(device *v1alpha1.NicDevice) (breakout, postBreakout []types.DMSConfigOp, err error)
 	// RuntimeConfigApplied checks if the desired Spectrum-X runtime spec is applied to the device
 	RuntimeConfigApplied(device *v1alpha1.NicDevice) (bool, error)
 	// ApplyRuntimeConfig applies the desired Spectrum-X runtime spec to the device
@@ -70,9 +51,16 @@ type SpectrumXManager interface {
 }
 
 type spectrumXConfigManager struct {
-	spectrumXConfigs map[string]*types.SpectrumXConfig
-	dmsManager       dms.DMSManager
-	execInterface    execUtils.Interface
+	dmsManager    dms.DMSManager
+	execInterface execUtils.Interface
+	// blueprintsBaseDir is the on-disk base directory under which the daemon
+	// materializes blueprint ConfigMaps (one subdir per ConfigMap name); the planner
+	// consumes <base>/<version> via --blueprints-root. Always non-empty (defaulted in
+	// the constructor); library consumers override it. See docs/design-dms-blueprints-spcx.md §3.3.
+	blueprintsBaseDir string
+	// planner renders the do-SPCX plan. Currently a stub returning the committed
+	// example plans until DMS ships the /nvidia/blueprints/plan action.
+	planner Planner
 
 	ccProcesses       map[string]*ccProcess
 	ccTerminationChan chan string // buffered; carries RDMA iface name on unexpected exit
@@ -90,560 +78,18 @@ type ccProcess struct {
 	cmdErr   error
 }
 
-// filterParameters filters parameters by DeviceId, Breakout (numberOfPlanes), and Multiplane mode
-func filterParameters(params []types.ConfigurationParameter, deviceType string, numberOfPlanes int, multiplaneMode string) []types.ConfigurationParameter {
-	filtered := []types.ConfigurationParameter{}
-	for _, param := range params {
-		if param.DeviceId != "" && param.DeviceId != deviceType {
-			continue
-		}
-		if param.Breakout != 0 && param.Breakout != numberOfPlanes {
-			continue
-		}
-		if param.Multiplane != "" && param.Multiplane != multiplaneMode {
-			continue
-		}
-		// HwplbFirstPortOnly only takes effect in hwplb mode; clear it otherwise
-		if param.HwplbFirstPortOnly && multiplaneMode != consts.MultiplaneModeHwplb {
-			param.HwplbFirstPortOnly = false
-		}
-		filtered = append(filtered, param)
-	}
-	return filtered
-}
-
-// getDesiredConfig looks up the SpectrumXConfig for the device's version
-func (m *spectrumXConfigManager) getDesiredConfig(device *v1alpha1.NicDevice) (*types.SpectrumXConfig, error) {
-	version := device.Spec.Configuration.Template.SpectrumXOptimized.Version
-	config, ok := m.spectrumXConfigs[version]
-	if !ok {
-		return nil, fmt.Errorf("spectrum-x config version %s not found", version)
-	}
-	return config, nil
-}
-
-// GetBreakoutMlxConfig returns the breakout mlxconfig map for the device
-func (m *spectrumXConfigManager) GetBreakoutMlxConfig(device *v1alpha1.NicDevice) (map[string]string, error) {
-	config, err := m.getDesiredConfig(device)
-	if err != nil {
-		return nil, err
-	}
-
-	spcXSpec := device.Spec.Configuration.Template.SpectrumXOptimized
-	multiplaneMode := spcXSpec.MultiplaneMode
-	deviceType := device.Status.Type
-	numberOfPlanes := spcXSpec.NumberOfPlanes
-
-	devices, ok := config.MlxConfig[multiplaneMode]
-	if !ok {
-		return nil, nil
-	}
-	deviceConfig, ok := devices[deviceType]
-	if !ok {
-		return nil, nil
-	}
-	breakoutConfig, ok := deviceConfig.Breakout[numberOfPlanes]
-	if !ok {
-		return nil, nil
-	}
-	return breakoutConfig, nil
-}
-
-// GetPostBreakoutMlxConfig returns the post-breakout mlxconfig map for the device
-func (m *spectrumXConfigManager) GetPostBreakoutMlxConfig(device *v1alpha1.NicDevice) (map[string]string, error) {
-	config, err := m.getDesiredConfig(device)
-	if err != nil {
-		return nil, err
-	}
-
-	spcXSpec := device.Spec.Configuration.Template.SpectrumXOptimized
-	multiplaneMode := spcXSpec.MultiplaneMode
-	deviceType := device.Status.Type
-
-	devices, ok := config.MlxConfig[multiplaneMode]
-	if !ok {
-		return nil, nil
-	}
-	deviceConfig, ok := devices[deviceType]
-	if !ok {
-		return nil, nil
-	}
-	return deviceConfig.PostBreakout, nil
-}
-
-// getCnpDscpPath returns the sysfs path for CNP DSCP for a given interface
-func getCnpDscpPath(interfaceName string) string {
-	return fmt.Sprintf(cnpDscpSysfsPathTemplate, interfaceName)
-}
-
-// checkCnpDscp checks if CNP DSCP is set to the expected value for all ports
-func checkCnpDscp(device *v1alpha1.NicDevice) (bool, error) {
-	log.Log.V(2).Info("SpectrumXConfigManager.checkCnpDscp()", "device", device.Name)
-
-	for _, port := range device.Status.Ports {
-		if port.NetworkInterface == "" {
-			log.Log.V(2).Info("SpectrumXConfigManager.checkCnpDscp(): skipping port without network interface", "port", port.PCI)
-			continue
-		}
-
-		cnpDscpPath := getCnpDscpPath(port.NetworkInterface)
-		data, err := os.ReadFile(cnpDscpPath)
-		if err != nil {
-			log.Log.Error(err, "checkCnpDscp(): failed to read CNP DSCP file", "path", cnpDscpPath, "device", device.Name)
-			return false, err
-		}
-
-		value := strings.TrimSpace(string(data))
-		if value != cnpDscpExpectedValue {
-			log.Log.V(2).Info("SpectrumXConfigManager.checkCnpDscp(): CNP DSCP value mismatch",
-				"device", device.Name, "port", port.NetworkInterface, "expected", cnpDscpExpectedValue, "actual", value)
-			return false, nil
-		}
-	}
-
-	return true, nil
-}
-
-// writeCnpDscp writes the expected CNP DSCP value for all ports
-func writeCnpDscp(device *v1alpha1.NicDevice) error {
-	log.Log.V(2).Info("SpectrumXConfigManager.writeCnpDscp()", "device", device.Name)
-
-	for _, port := range device.Status.Ports {
-		if port.NetworkInterface == "" {
-			log.Log.V(2).Info("SpectrumXConfigManager.writeCnpDscp(): skipping port without network interface", "port", port.PCI)
-			continue
-		}
-
-		cnpDscpPath := getCnpDscpPath(port.NetworkInterface)
-		err := os.WriteFile(cnpDscpPath, []byte(cnpDscpExpectedValue), 0644)
-		if err != nil {
-			log.Log.Error(err, "writeCnpDscp(): failed to write CNP DSCP file", "path", cnpDscpPath, "device", device.Name)
-			return err
-		}
-		log.Log.V(2).Info("SpectrumXConfigManager.writeCnpDscp(): wrote CNP DSCP value",
-			"device", device.Name, "port", port.NetworkInterface, "value", cnpDscpExpectedValue)
-	}
-
-	return nil
-}
-
-// checkCCProbeMPMode checks if CC Probe MP mode is set on all PFs via mlxreg.
-// Workaround: CC Probe MP mode is not configurable via DMS, so we use mlxreg instead.
-// Remove this workaround once the parameter is added to DMS.
-func (m *spectrumXConfigManager) checkCCProbeMPMode(device *v1alpha1.NicDevice) (bool, error) {
-	log.Log.V(2).Info("SpectrumXConfigManager.checkCCProbeMPMode()", "device", device.Name)
-
-	for _, port := range device.Status.Ports {
-		cmd := m.execInterface.Command(mlxregBinary, "-d", port.PCI,
-			"--reg_name", ccProbeMPModeRegName, "--get")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Log.Error(err, "checkCCProbeMPMode(): failed to run mlxreg get", "device", device.Name, "pci", port.PCI)
-			return false, fmt.Errorf("failed to check CC Probe MP mode via mlxreg for PF %s: %w", port.PCI, err)
-		}
-		// Parse the mlxreg table output to find the cc_probe_mp_mode field and its value.
-		// Output format: "cc_probe_mp_mode                               | 0x00000001"
-		found := false
-		for _, line := range strings.Split(string(output), "\n") {
-			if strings.Contains(line, ccProbeMPModeFieldName) {
-				found = true
-				if !strings.Contains(line, ccProbeMPModeExpectedValue) {
-					log.Log.V(2).Info("checkCCProbeMPMode(): cc_probe_mp_mode not set on PF",
-						"device", device.Name, "pci", port.PCI, "line", strings.TrimSpace(line))
-					return false, nil
-				}
-				break
-			}
-		}
-		if !found {
-			log.Log.V(2).Info("checkCCProbeMPMode(): cc_probe_mp_mode field not found in mlxreg output",
-				"device", device.Name, "pci", port.PCI)
-			return false, nil
-		}
-	}
-
-	log.Log.V(2).Info("checkCCProbeMPMode(): cc_probe_mp_mode is set on all PFs", "device", device.Name)
-	return true, nil
-}
-
-// setCCProbeMPMode sets CC Probe MP mode on all PFs via mlxreg.
-// Workaround: CC Probe MP mode is not configurable via DMS, so we use mlxreg instead.
-// Remove this workaround once the parameter is added to DMS.
-func (m *spectrumXConfigManager) setCCProbeMPMode(device *v1alpha1.NicDevice) error {
-	log.Log.V(2).Info("SpectrumXConfigManager.setCCProbeMPMode()", "device", device.Name)
-
-	for _, port := range device.Status.Ports {
-		cmd := m.execInterface.Command(mlxregBinary, "-d", port.PCI,
-			"--reg_name", ccProbeMPModeRegName, "--set", ccProbeMPModeFieldSet, "--yes")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Log.Error(err, "setCCProbeMPMode(): failed to run mlxreg set",
-				"device", device.Name, "pci", port.PCI, "output", string(output))
-			return fmt.Errorf("failed to set CC Probe MP mode via mlxreg for PF %s: %w", port.PCI, err)
-		}
-		log.Log.V(2).Info("setCCProbeMPMode(): successfully set cc_probe_mp_mode on PF",
-			"device", device.Name, "pci", port.PCI)
-	}
-
-	return nil
-}
-
-// checkDmsParamsApplied checks if the given DMS parameters are applied to the device
-func checkDmsParamsApplied(device *v1alpha1.NicDevice, params []types.ConfigurationParameter, dmsClient dms.DMSClient) (bool, error) {
-	log.Log.Info("SpectrumXConfigManager.checkDmsParamsApplied()", "device", device.Name)
-
-	values, err := dmsClient.GetParameters(params)
-	if err != nil {
-		if types.IsValuesDoNotMatchError(err) {
-			log.Log.V(2).Info("checkDmsParamsApplied(): values do not match across ports/priorities", "device", device.Name, "error", err.Error())
-			return false, nil
-		}
-		log.Log.Error(err, "checkDmsParamsApplied(): failed to get DMS config", "device", device.Name)
-		return false, err
-	}
-	log.Log.V(2).Info("SpectrumXConfigManager.checkDmsParamsApplied(): got the following values", "device", device.Name, "values", values)
-
-	for _, param := range params {
-		if values[param.DMSPath] != param.Value && values[param.DMSPath] != param.AlternativeValue {
-			log.Log.V(2).Info("SpectrumXConfigManager.checkDmsParamsApplied(): parameter not applied", "device", device.Name, "param", param)
-			return false, nil
-		}
-	}
-
-	return true, nil
-}
-
-// RuntimeConfigApplied checks if the desired Spectrum-X runtime spec is applied to the device
-func (m *spectrumXConfigManager) RuntimeConfigApplied(device *v1alpha1.NicDevice) (bool, error) {
-	log.Log.Info("SpectrumXConfigManager.RuntimeConfigApplied()", "device", device.Name)
-
-	spcXSpec := device.Spec.Configuration.Template.SpectrumXOptimized
-	desiredConfig, found := m.spectrumXConfigs[spcXSpec.Version]
-	if !found {
-		return false, fmt.Errorf("spectrumx config not found for version %s", spcXSpec.Version)
-	}
-
-	dmsClient, err := dms.GetDMSClientForDevice(m.dmsManager, device)
-	if err != nil {
-		log.Log.Error(err, "RuntimeConfigApplied(): failed to get DMS client", "device", device.Name)
-		return false, err
-	}
-
-	// Filter parameters by device type, breakout (number of planes), and multiplane mode
-	deviceType := device.Status.Type
-	numberOfPlanes := spcXSpec.NumberOfPlanes
-	multiplaneMode := spcXSpec.MultiplaneMode
-
-	roceParams := filterParameters(desiredConfig.RuntimeConfig.Roce, deviceType, numberOfPlanes, multiplaneMode)
-	log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking RoCE config", "device", device.Name)
-	roceApplied, err := checkDmsParamsApplied(device, roceParams, dmsClient)
-	if err != nil {
-		log.Log.Error(err, "RuntimeConfigApplied(): failed to check if RoCE config is applied", "device", device.Name)
-		return false, err
-	}
-
-	if !roceApplied {
-		return false, nil
-	}
-
-	// Check CNP DSCP after RoCE config
-	log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking CNP DSCP config", "device", device.Name)
-	cnpDscpApplied, err := checkCnpDscp(device)
-	if err != nil {
-		log.Log.Error(err, "RuntimeConfigApplied(): failed to check if CNP DSCP is applied", "device", device.Name)
-		return false, err
-	}
-
-	if !cnpDscpApplied {
-		return false, nil
-	}
-
-	adaptiveRoutingParams := filterParameters(desiredConfig.RuntimeConfig.AdaptiveRouting, deviceType, numberOfPlanes, multiplaneMode)
-
-	if multiplaneMode == consts.MultiplaneModeHwplb && len(adaptiveRoutingParams) > 0 {
-		// Workaround: CC Probe MP mode must be checked BEFORE the last adaptive routing
-		// parameter is read. Split the params: all except last, then mlxreg, then last.
-		// Remove this workaround once the parameter is added to DMS.
-		lastIndex := len(adaptiveRoutingParams) - 1
-		beforeLastParams := adaptiveRoutingParams[:lastIndex]
-		lastParam := adaptiveRoutingParams[lastIndex:]
-
-		if len(beforeLastParams) > 0 {
-			log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking Adaptive Routing config (before CC Probe MP mode)", "device", device.Name)
-			applied, err := checkDmsParamsApplied(device, beforeLastParams, dmsClient)
-			if err != nil {
-				log.Log.Error(err, "RuntimeConfigApplied(): failed to check Adaptive Routing config (before CC Probe MP mode)", "device", device.Name)
-				return false, err
-			}
-			if !applied {
-				return false, nil
-			}
-		}
-
-		// Workaround: Check CC Probe MP mode via mlxreg on all PFs (not configurable via DMS)
-		log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking CC Probe MP mode via mlxreg", "device", device.Name)
-		ccProbeMPApplied, err := m.checkCCProbeMPMode(device)
-		if err != nil {
-			log.Log.Error(err, "RuntimeConfigApplied(): failed to check CC Probe MP mode", "device", device.Name)
-			return false, err
-		}
-		if !ccProbeMPApplied {
-			return false, nil
-		}
-
-		log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking Adaptive Routing config (after CC Probe MP mode)", "device", device.Name)
-		adaptiveRoutingApplied, err := checkDmsParamsApplied(device, lastParam, dmsClient)
-		if err != nil {
-			log.Log.Error(err, "RuntimeConfigApplied(): failed to check Adaptive Routing config (after CC Probe MP mode)", "device", device.Name)
-			return false, err
-		}
-		if !adaptiveRoutingApplied {
-			return false, nil
-		}
-	} else {
-		log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking Adaptive Routing config", "device", device.Name)
-		adaptiveRoutingApplied, err := checkDmsParamsApplied(device, adaptiveRoutingParams, dmsClient)
-		if err != nil {
-			log.Log.Error(err, "RuntimeConfigApplied(): failed to check if Adaptive Routing config is applied", "device", device.Name)
-			return false, err
-		}
-		if !adaptiveRoutingApplied {
-			return false, nil
-		}
-	}
-
-	if desiredConfig.UseSoftwareCCAlgorithm {
-		log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): check if DOCA SPC-X CC algorithm is running", "device", device.Name)
-		if multiplaneMode == consts.MultiplaneModeHwplb {
-			if len(device.Status.Ports) == 0 || !m.IsDocaSpcXCCRunning(device.Status.Ports[0].RdmaInterface) {
-				log.Log.Info("RuntimeConfigApplied(): DOCA SPC-X CC algorithm is not running", "device", device.Name)
-				return false, nil
-			}
-		} else {
-			for _, port := range device.Status.Ports {
-				if !m.IsDocaSpcXCCRunning(port.RdmaInterface) {
-					log.Log.Info("RuntimeConfigApplied(): DOCA SPC-X CC algorithm is not running", "device", device.Name)
-					return false, nil
-				}
-			}
-		}
-	} else {
-		log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): not running DOCA SPC-X CC algorithm as specified in config", "device", device.Name)
-	}
-
-	congestionControlParams := filterParameters(desiredConfig.RuntimeConfig.CongestionControl, deviceType, numberOfPlanes, multiplaneMode)
-	log.Log.V(2).Info("SpectrumXConfigManager.RuntimeConfigApplied(): checking Congestion Control config", "device", device.Name)
-	congestionControlApplied, err := checkDmsParamsApplied(device, congestionControlParams, dmsClient)
-	if err != nil {
-		log.Log.Error(err, "RuntimeConfigApplied(): failed to check if Congestion Control config is applied", "device", device.Name)
-		return false, err
-	}
-
-	if !congestionControlApplied {
-		return false, nil
-	}
-
-	overlay := spcXSpec.Overlay
-	var interPacketGapParams []types.ConfigurationParameter
-	switch overlay {
-	case consts.OverlayL3:
-		interPacketGapParams = desiredConfig.RuntimeConfig.InterPacketGap.L3EVPN
-	case consts.OverlayNone:
-		interPacketGapParams = desiredConfig.RuntimeConfig.InterPacketGap.PureL3
-	default:
-		return false, fmt.Errorf("invalid overlay %s", overlay)
-	}
-	interPacketGapParams = filterParameters(interPacketGapParams, deviceType, numberOfPlanes, multiplaneMode)
-
-	overlayParamsApplied, err := checkDmsParamsApplied(device, interPacketGapParams, dmsClient)
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Spectrum-X InterPacketGap config", "device", device.Name)
-		return false, err
-	}
-
-	if !overlayParamsApplied {
-		return false, nil
-	}
-
-	return true, nil
-
-}
-
-// ApplyRuntimeConfig applies the desired Spectrum-X runtime spec to the device
-func (m *spectrumXConfigManager) ApplyRuntimeConfig(device *v1alpha1.NicDevice) (*types.RuntimeConfigurationApplyResult, error) {
-	spcXSpec := device.Spec.Configuration.Template.SpectrumXOptimized
-	desiredConfig, found := m.spectrumXConfigs[spcXSpec.Version]
-	if !found {
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, fmt.Errorf("spectrumx config not found for version %s", spcXSpec.Version)
-	}
-
-	dmsClient, err := dms.GetDMSClientForDevice(m.dmsManager, device)
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to get DMS client", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	// Filter parameters by device type, breakout (number of planes), and multiplane mode
-	deviceType := device.Status.Type
-	numberOfPlanes := spcXSpec.NumberOfPlanes
-	multiplaneMode := spcXSpec.MultiplaneMode
-
-	roceParams := filterParameters(desiredConfig.RuntimeConfig.Roce, deviceType, numberOfPlanes, multiplaneMode)
-	log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting RoCE config", "device", device.Name)
-	err = dmsClient.SetParameters(roceParams)
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Spectrum-X RoCE config", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	// Write CNP DSCP after RoCE config
-	log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting CNP DSCP config", "device", device.Name)
-	err = writeCnpDscp(device)
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to set CNP DSCP config", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	adaptiveRoutingParams := filterParameters(desiredConfig.RuntimeConfig.AdaptiveRouting, deviceType, numberOfPlanes, multiplaneMode)
-
-	if multiplaneMode == consts.MultiplaneModeHwplb && len(adaptiveRoutingParams) > 0 {
-		// Workaround: CC Probe MP mode must be set BEFORE the last adaptive routing
-		// parameter is applied. Split the params: all except last, then mlxreg, then last.
-		// Remove this workaround once the parameter is added to DMS.
-		lastIndex := len(adaptiveRoutingParams) - 1
-		beforeLastParams := adaptiveRoutingParams[:lastIndex]
-		lastParam := adaptiveRoutingParams[lastIndex:]
-
-		if len(beforeLastParams) > 0 {
-			log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting Adaptive Routing config (before CC Probe MP mode)", "device", device.Name)
-			err = dmsClient.SetParameters(beforeLastParams)
-			if err != nil {
-				log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Adaptive Routing config (before CC Probe MP mode)", "device", device.Name)
-				return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-			}
-		}
-
-		// Workaround: Set CC Probe MP mode via mlxreg on all PFs (not configurable via DMS)
-		log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting CC Probe MP mode via mlxreg", "device", device.Name)
-		err = m.setCCProbeMPMode(device)
-		if err != nil {
-			log.Log.Error(err, "ApplyRuntimeConfig(): failed to set CC Probe MP mode", "device", device.Name)
-			return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-		}
-
-		log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting Adaptive Routing config (after CC Probe MP mode)", "device", device.Name)
-		err = dmsClient.SetParameters(lastParam)
-		if err != nil {
-			log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Adaptive Routing config (after CC Probe MP mode)", "device", device.Name)
-			return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-		}
-	} else {
-		log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting Adaptive Routing config", "device", device.Name)
-		err = dmsClient.SetParameters(adaptiveRoutingParams)
-		if err != nil {
-			log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Spectrum-X Adaptive Routing config", "device", device.Name)
-			return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-		}
-	}
-
-	if desiredConfig.UseSoftwareCCAlgorithm {
-		log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): running DOCA SPC-X CC algorithm", "device", device.Name)
-		if multiplaneMode == consts.MultiplaneModeHwplb {
-			if len(device.Status.Ports) == 0 {
-				return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, fmt.Errorf("no ports available for device %s", device.Name)
-			}
-			err = m.RunDocaSpcXCC(device.Status.Ports[0])
-			if err != nil {
-				log.Log.Error(err, "ApplyRuntimeConfig(): failed to run DOCA SPC-X CC", "device", device.Name)
-				return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-			}
-		} else {
-			for _, port := range device.Status.Ports {
-				err = m.RunDocaSpcXCC(port)
-				if err != nil {
-					log.Log.Error(err, "ApplyRuntimeConfig(): failed to run DOCA SPC-X CC", "device", device.Name)
-					return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-				}
-			}
-		}
-	} else {
-		log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): not running DOCA SPC-X CC algorithm as specified in config", "device", device.Name)
-	}
-
-	congestionControlParams := filterParameters(desiredConfig.RuntimeConfig.CongestionControl, deviceType, numberOfPlanes, multiplaneMode)
-	log.Log.V(2).Info("SpectrumXConfigManager.ApplyRuntimeConfig(): setting Congestion Control config", "device", device.Name)
-	err = dmsClient.SetParameters(congestionControlParams)
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Spectrum-X Congestion Control config", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	overlay := spcXSpec.Overlay
-	var interPacketGapParams []types.ConfigurationParameter
-	switch overlay {
-	case consts.OverlayL3:
-		interPacketGapParams = desiredConfig.RuntimeConfig.InterPacketGap.L3EVPN
-	case consts.OverlayNone:
-		interPacketGapParams = desiredConfig.RuntimeConfig.InterPacketGap.PureL3
-	default:
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, fmt.Errorf("invalid overlay %s", overlay)
-	}
-	interPacketGapParams = filterParameters(interPacketGapParams, deviceType, numberOfPlanes, multiplaneMode)
-
-	err = dmsClient.SetParameters(interPacketGapParams)
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to set Spectrum-X InterPacketGap config", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	// Wait for 1 second to apply the IPG settings
-	time.Sleep(1 * time.Second)
-	err = dmsClient.SetParameters([]types.ConfigurationParameter{
-		{
-			Name:      "Shut down interface",
-			Value:     "false",
-			DMSPath:   "/interfaces/interface/config/enabled",
-			ValueType: "bool",
-		},
-	})
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to shut down interface", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	err = dmsClient.SetParameters([]types.ConfigurationParameter{
-		{
-			Name:      "Bring up interface to apply IPG settings",
-			Value:     "true",
-			DMSPath:   "/interfaces/interface/config/enabled",
-			ValueType: "bool",
-		},
-	})
-	if err != nil {
-		log.Log.Error(err, "ApplyRuntimeConfig(): failed to bring up interface", "device", device.Name)
-		return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-	return &types.RuntimeConfigurationApplyResult{Status: types.ApplyStatusSuccess}, nil
-}
-
-// GetDocaCCTargetVersion returns the target version of DOCA SPC-X CC for the device
+// GetDocaCCTargetVersion returns the target version of DOCA SPC-X CC to install for
+// the device, or "" to install nothing (use whatever is already present).
+//
+// Open item O12: the do-SPCX plan does not carry a doca_spcx_cc binary version, so we
+// cannot derive a target version from it yet. We return "" — the controller then skips
+// the version-specific install while ApplyRuntimeConfig still launches the binary before
+// the cc group. See docs/design-dms-blueprints-spcx.md.
 func (m *spectrumXConfigManager) GetDocaCCTargetVersion(device *v1alpha1.NicDevice) (string, error) {
-	if device.Spec.Configuration == nil || device.Spec.Configuration.Template == nil || device.Spec.Configuration.Template.SpectrumXOptimized == nil {
+	if spectrumXSpec(device) == nil {
 		log.Log.V(2).Info("SpectrumXConfigManager.GetDocaCCTargetVersion(): device SPC-X spec is empty, no DOCA SPC-X CC required", "device", device.Name)
 		return "", nil
 	}
-
-	spcXVersion := device.Spec.Configuration.Template.SpectrumXOptimized.Version
-	config, found := m.spectrumXConfigs[spcXVersion]
-	if !found {
-		return "", fmt.Errorf("spectrumx config not found for version %s", spcXVersion)
-	}
-
-	if config.UseSoftwareCCAlgorithm {
-		log.Log.V(2).Info("SpectrumXConfigManager.GetDocaCCTargetVersion(): using software CC algorithm", "device", device.Name, "version", config.DocaCCVersion)
-		return config.DocaCCVersion, nil
-	}
-
 	return "", nil
 }
 
@@ -729,10 +175,19 @@ func (m *spectrumXConfigManager) GetCCTerminationChannel() <-chan string {
 	return m.ccTerminationChan
 }
 
-func NewSpectrumXConfigManager(dmsManager dms.DMSManager, spectrumXConfigs map[string]*types.SpectrumXConfig) SpectrumXManager {
+// NewSpectrumXConfigManager creates a SpectrumXManager. blueprintsBaseDir is the
+// on-disk base directory under which blueprint ConfigMaps are materialized (one subdir
+// per ConfigMap name); pass "" to use the operator in-container default
+// (consts.SpectrumXBlueprintsBaseDir). Library consumers pass their own directory.
+// See docs/design-dms-blueprints-spcx.md §3.3.
+func NewSpectrumXConfigManager(dmsManager dms.DMSManager, blueprintsBaseDir string) SpectrumXManager {
+	if blueprintsBaseDir == "" {
+		blueprintsBaseDir = consts.SpectrumXBlueprintsBaseDir
+	}
 	return &spectrumXConfigManager{
 		dmsManager:        dmsManager,
-		spectrumXConfigs:  spectrumXConfigs,
+		blueprintsBaseDir: blueprintsBaseDir,
+		planner:           newStubPlanner(),
 		execInterface:     execUtils.New(),
 		ccProcesses:       make(map[string]*ccProcess),
 		ccTerminationChan: make(chan string, 10),

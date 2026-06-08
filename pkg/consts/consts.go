@@ -170,6 +170,14 @@ const (
 	MultiplaneModeHwplb    = "hwplb"
 	MultiplaneModeUniplane = "uniplane"
 
+	// SpectrumXBlueprintsBaseDir is the on-disk base directory where the daemon
+	// materializes Spectrum-X blueprint ConfigMaps, one subdirectory per ConfigMap
+	// name. The DMS planner consumes <base>/<name> via --blueprints-root.
+	SpectrumXBlueprintsBaseDir = "/var/lib/nic-configuration-operator/spectrumx-blueprints"
+	// SpectrumXBlueprintLabel marks ConfigMaps (in the operator namespace) that the
+	// daemon should materialize as Spectrum-X blueprints.
+	SpectrumXBlueprintLabel = "configuration.net.nvidia.com/spectrumx-blueprint"
+
 	HostRestrictionLevelPrivileged = "privileged"
 	HostRestrictionLevelRestricted = "restricted"
 

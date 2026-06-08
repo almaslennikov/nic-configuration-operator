@@ -15,64 +15,43 @@ type SpectrumXManager struct {
 	mock.Mock
 }
 
-// GetBreakoutMlxConfig provides a mock function with given fields: device
-func (_m *SpectrumXManager) GetBreakoutMlxConfig(device *v1alpha1.NicDevice) (map[string]string, error) {
+// GetPrepareOps provides a mock function with given fields: device
+func (_m *SpectrumXManager) GetPrepareOps(device *v1alpha1.NicDevice) ([]types.DMSConfigOp, []types.DMSConfigOp, error) {
 	ret := _m.Called(device)
 
 	if len(ret) == 0 {
-		panic("no return value specified for GetBreakoutMlxConfig")
+		panic("no return value specified for GetPrepareOps")
 	}
 
-	var r0 map[string]string
-	var r1 error
-	if rf, ok := ret.Get(0).(func(*v1alpha1.NicDevice) (map[string]string, error)); ok {
+	var r0 []types.DMSConfigOp
+	var r1 []types.DMSConfigOp
+	var r2 error
+	if rf, ok := ret.Get(0).(func(*v1alpha1.NicDevice) ([]types.DMSConfigOp, []types.DMSConfigOp, error)); ok {
 		return rf(device)
 	}
-	if rf, ok := ret.Get(0).(func(*v1alpha1.NicDevice) map[string]string); ok {
+	if rf, ok := ret.Get(0).(func(*v1alpha1.NicDevice) []types.DMSConfigOp); ok {
 		r0 = rf(device)
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(map[string]string)
+			r0 = ret.Get(0).([]types.DMSConfigOp)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(*v1alpha1.NicDevice) error); ok {
+	if rf, ok := ret.Get(1).(func(*v1alpha1.NicDevice) []types.DMSConfigOp); ok {
 		r1 = rf(device)
 	} else {
-		r1 = ret.Error(1)
-	}
-
-	return r0, r1
-}
-
-// GetPostBreakoutMlxConfig provides a mock function with given fields: device
-func (_m *SpectrumXManager) GetPostBreakoutMlxConfig(device *v1alpha1.NicDevice) (map[string]string, error) {
-	ret := _m.Called(device)
-
-	if len(ret) == 0 {
-		panic("no return value specified for GetPostBreakoutMlxConfig")
-	}
-
-	var r0 map[string]string
-	var r1 error
-	if rf, ok := ret.Get(0).(func(*v1alpha1.NicDevice) (map[string]string, error)); ok {
-		return rf(device)
-	}
-	if rf, ok := ret.Get(0).(func(*v1alpha1.NicDevice) map[string]string); ok {
-		r0 = rf(device)
-	} else {
-		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(map[string]string)
+		if ret.Get(1) != nil {
+			r1 = ret.Get(1).([]types.DMSConfigOp)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(*v1alpha1.NicDevice) error); ok {
-		r1 = rf(device)
+	if rf, ok := ret.Get(2).(func(*v1alpha1.NicDevice) error); ok {
+		r2 = rf(device)
 	} else {
-		r1 = ret.Error(1)
+		r2 = ret.Error(2)
 	}
 
-	return r0, r1
+	return r0, r1, r2
 }
 
 // ApplyRuntimeConfig provides a mock function with given fields: device

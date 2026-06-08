@@ -59,6 +59,7 @@ type configurationManager struct {
 	configValidation       configValidation
 	nvConfigUtils          nvconfig.NVConfigUtils
 	spectrumXConfigManager spectrumx.SpectrumXManager
+	dmsManager             dms.DMSManager
 }
 
 // ValidateDeviceNvSpec will validate device's non-volatile spec against already applied configuration on the host
@@ -72,38 +73,14 @@ func (h configurationManager) ValidateDeviceNvSpec(ctx context.Context, device *
 	log.Log.Info("configurationManager.ValidateDeviceNvSpec", "device", device.Name)
 
 	if device.Spec.Configuration.Template != nil && device.Spec.Configuration.Template.SpectrumXOptimized != nil && device.Spec.Configuration.Template.SpectrumXOptimized.Enabled {
-		pci := device.Status.Ports[0].PCI
-
-		breakoutParams, err := h.spectrumXConfigManager.GetBreakoutMlxConfig(device)
+		applied, err := h.spectrumXNVConfigApplied(device)
 		if err != nil {
 			return false, false, err
 		}
-		postBreakoutParams, err := h.spectrumXConfigManager.GetPostBreakoutMlxConfig(device)
-		if err != nil {
-			return false, false, err
+		if !applied {
+			log.Log.V(2).Info("spectrum-x nv config not applied, update and reboot required", "device", device.Name)
+			return true, true, nil
 		}
-		// Merge rawNvConfig overrides into the appropriate phase:
-		// params that overlap with breakout go into breakout, the rest into postBreakout
-		postBreakoutParams = mergeRawNvConfigIntoPhases(device, breakoutParams, postBreakoutParams)
-
-		if len(breakoutParams) > 0 {
-			if mismatch, err := h.checkMlxConfigMismatch(ctx, pci, breakoutParams); err != nil {
-				return false, false, err
-			} else if mismatch {
-				log.Log.V(2).Info("breakout config not applied, update and reboot required", "device", device.Name)
-				return true, true, nil
-			}
-		}
-
-		if len(postBreakoutParams) > 0 {
-			if mismatch, err := h.checkMlxConfigMismatch(ctx, pci, postBreakoutParams); err != nil {
-				return false, false, err
-			} else if mismatch {
-				log.Log.V(2).Info("postBreakout config not applied, update and reboot required", "device", device.Name)
-				return true, true, nil
-			}
-		}
-
 		return false, false, nil
 	}
 
@@ -181,7 +158,7 @@ func (h configurationManager) ApplyNVConfiguration(ctx context.Context, device *
 	if device.Spec.Configuration.Template != nil &&
 		device.Spec.Configuration.Template.SpectrumXOptimized != nil &&
 		device.Spec.Configuration.Template.SpectrumXOptimized.Enabled {
-		return h.applySpectrumXNVConfiguration(ctx, device, options)
+		return h.applySpectrumXNVConfiguration(device)
 	}
 
 	nvConfigsForPorts, err := h.queryNvConfigs(ctx, device)
@@ -283,84 +260,6 @@ func (h configurationManager) ApplyNVConfiguration(ctx context.Context, device *
 	}
 
 	return &types.ConfigurationApplyResult{Status: status, RebootRequired: anyParamsApplied}, nil
-}
-
-// checkMlxConfigMismatch queries mlxconfig for the given params and returns true if any value doesn't match.
-func (h configurationManager) checkMlxConfigMismatch(ctx context.Context, pci string, params map[string]string) (bool, error) {
-	paramNames := make([]string, 0, len(params))
-	for name := range params {
-		paramNames = append(paramNames, name)
-	}
-
-	query, err := h.nvConfigUtils.QueryNvConfig(ctx, pci, paramNames)
-	if err != nil {
-		return false, err
-	}
-
-	for name, desiredValue := range params {
-		currentValues := query.CurrentConfig[name]
-		if !slices.Contains(currentValues, desiredValue) {
-			log.Log.V(2).Info("mlxconfig parameter mismatch", "param", name, "desired", desiredValue, "current", currentValues)
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// applySpectrumXNVConfiguration handles the Spectrum-X NV configuration path (breakout + postBreakout)
-func (h configurationManager) applySpectrumXNVConfiguration(ctx context.Context, device *v1alpha1.NicDevice, options *types.ConfigurationOptions) (*types.ConfigurationApplyResult, error) {
-	pci := device.Status.Ports[0].PCI
-
-	breakoutParams, err := h.spectrumXConfigManager.GetBreakoutMlxConfig(device)
-	if err != nil {
-		return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-
-	postBreakoutParams, err := h.spectrumXConfigManager.GetPostBreakoutMlxConfig(device)
-	if err != nil {
-		return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-	}
-	// Merge rawNvConfig overrides into the appropriate phase:
-	// params that overlap with breakout go into breakout, the rest into postBreakout
-	postBreakoutParams = mergeRawNvConfigIntoPhases(device, breakoutParams, postBreakoutParams)
-
-	// Check and apply breakout config — requires reboot before postBreakout can be applied
-	if len(breakoutParams) > 0 {
-		if mismatch, err := h.checkMlxConfigMismatch(ctx, pci, breakoutParams); err != nil {
-			return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-		} else if mismatch {
-			log.Log.Info("applying breakout config", "device", device.Name)
-			if err := h.nvConfigUtils.SetNvConfigParametersBatch(pci, breakoutParams, options.WithDefault); err != nil {
-				return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-			}
-			log.Log.Info("breakout config applied, reboot required", "device", device.Name)
-			return &types.ConfigurationApplyResult{Status: types.ApplyStatusPartiallyApplied, RebootRequired: true}, nil
-		}
-	}
-
-	// Check and apply postBreakout config (includes rawNvConfig params that don't overlap with breakout)
-	if len(postBreakoutParams) > 0 {
-		if mismatch, err := h.checkMlxConfigMismatch(ctx, pci, postBreakoutParams); err != nil {
-			return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-		} else if mismatch {
-			// Apply concatenated breakout + postBreakout params
-			merged := make(map[string]string, len(breakoutParams)+len(postBreakoutParams))
-			for k, v := range breakoutParams {
-				merged[k] = v
-			}
-			for k, v := range postBreakoutParams {
-				merged[k] = v
-			}
-			log.Log.Info("applying postBreakout config", "device", device.Name)
-			if err := h.nvConfigUtils.SetNvConfigParametersBatch(pci, merged, options.WithDefault); err != nil {
-				return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
-			}
-			log.Log.Info("postBreakout config applied, reboot required", "device", device.Name)
-			return &types.ConfigurationApplyResult{Status: types.ApplyStatusSuccess, RebootRequired: true}, nil
-		}
-	}
-
-	return &types.ConfigurationApplyResult{Status: types.ApplyStatusNothingToDo}, nil
 }
 
 // applyResetToDefault resets NV config to defaults, preserving BF3 operation mode
@@ -506,45 +405,85 @@ func (h configurationManager) queryNvConfigs(ctx context.Context, device *v1alph
 	return nvConfigs, nil
 }
 
-// getRawNvConfigParams extracts rawNvConfig params from the device template,
-// dropping _Pn params whose port index is beyond the device's port count.
-func getRawNvConfigParams(device *v1alpha1.NicDevice) map[string]string {
-	template := device.Spec.Configuration.Template
-	if template == nil || len(template.RawNvConfig) == 0 {
-		return nil
+// spectrumXNVConfigApplied reports whether the device's Spectrum-X prepare-stage knobs
+// (breakout + post-breakout nvconfig), obtained from the SpectrumX manager, are applied
+// — checked via DMS.
+func (h configurationManager) spectrumXNVConfigApplied(device *v1alpha1.NicDevice) (bool, error) {
+	breakout, postBreakout, err := h.spectrumXConfigManager.GetPrepareOps(device)
+	if err != nil {
+		return false, err
 	}
-	portCount := len(device.Status.Ports)
-	params := make(map[string]string, len(template.RawNvConfig))
-	for _, rawParam := range template.RawNvConfig {
-		if n, ok := consts.PortSuffixNum(rawParam.Name); ok && n > portCount {
-			continue
+	dmsClient, err := dms.GetDMSClientForDevice(h.dmsManager, device)
+	if err != nil {
+		log.Log.Error(err, "spectrumXNVConfigApplied(): failed to get DMS client", "device", device.Name)
+		return false, err
+	}
+	for _, set := range [][]types.DMSConfigOp{breakout, postBreakout} {
+		applied, err := dms.OpsApplied(dmsClient, set)
+		if err != nil {
+			return false, err
 		}
-		params[rawParam.Name] = rawParam.Value
+		if !applied {
+			return false, nil
+		}
 	}
-	if len(params) == 0 {
-		return nil
-	}
-	return params
+	return true, nil
 }
 
-// mergeRawNvConfigIntoPhases merges rawNvConfig overrides into the appropriate Spectrum-X phase.
-// Params that overlap with breakout keys are overridden in breakoutParams;
-// all other raw params are merged into postBreakoutParams.
-func mergeRawNvConfigIntoPhases(device *v1alpha1.NicDevice, breakoutParams map[string]string, postBreakoutParams map[string]string) map[string]string {
-	for k, v := range getRawNvConfigParams(device) {
-		if _, exists := breakoutParams[k]; exists {
-			breakoutParams[k] = v
-		} else {
-			if postBreakoutParams == nil {
-				postBreakoutParams = make(map[string]string)
+// applySpectrumXNVConfiguration applies the Spectrum-X prepare-stage knobs via DMS:
+// breakout first (a reboot is required before post-breakout), then post-breakout
+// nvconfig. The two phases are realized across reconciles via RebootRequired, the same
+// breakout -> reboot -> post-breakout cadence as the regular flow. The breakout/
+// post-breakout ops come from the SpectrumX manager so the configuration manager can
+// sequence them with other NVConfig options (e.g. NetworkBay system-conf).
+func (h configurationManager) applySpectrumXNVConfiguration(device *v1alpha1.NicDevice) (*types.ConfigurationApplyResult, error) {
+	breakout, postBreakout, err := h.spectrumXConfigManager.GetPrepareOps(device)
+	if err != nil {
+		return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
+	}
+	dmsClient, err := dms.GetDMSClientForDevice(h.dmsManager, device)
+	if err != nil {
+		log.Log.Error(err, "applySpectrumXNVConfiguration(): failed to get DMS client", "device", device.Name)
+		return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
+	}
+
+	// Breakout first; requires a reboot before post-breakout can be applied.
+	if len(breakout) > 0 {
+		applied, err := dms.OpsApplied(dmsClient, breakout)
+		if err != nil {
+			return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
+		}
+		if !applied {
+			log.Log.Info("applying spectrum-x breakout knobs", "device", device.Name)
+			if err := dmsClient.SetParameters(breakout); err != nil {
+				return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
 			}
-			postBreakoutParams[k] = v
+			return &types.ConfigurationApplyResult{Status: types.ApplyStatusPartiallyApplied, RebootRequired: true}, nil
 		}
 	}
-	return postBreakoutParams
+
+	if len(postBreakout) > 0 {
+		applied, err := dms.OpsApplied(dmsClient, postBreakout)
+		if err != nil {
+			return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
+		}
+		if !applied {
+			// Re-assert breakout knobs alongside post-breakout, mirroring the merged apply.
+			merged := make([]types.DMSConfigOp, 0, len(breakout)+len(postBreakout))
+			merged = append(merged, breakout...)
+			merged = append(merged, postBreakout...)
+			log.Log.Info("applying spectrum-x post-breakout knobs", "device", device.Name)
+			if err := dmsClient.SetParameters(merged); err != nil {
+				return &types.ConfigurationApplyResult{Status: types.ApplyStatusFailed}, err
+			}
+			return &types.ConfigurationApplyResult{Status: types.ApplyStatusSuccess, RebootRequired: true}, nil
+		}
+	}
+
+	return &types.ConfigurationApplyResult{Status: types.ApplyStatusNothingToDo}, nil
 }
 
 func NewConfigurationManager(eventRecorder record.EventRecorder, dmsManager dms.DMSManager, nvConfigUtils nvconfig.NVConfigUtils, spectrumXConfigManager spectrumx.SpectrumXManager) ConfigurationManager {
 	utils := newConfigurationUtils(dmsManager)
-	return configurationManager{configurationUtils: utils, configValidation: newConfigValidation(utils, eventRecorder), nvConfigUtils: nvConfigUtils, spectrumXConfigManager: spectrumXConfigManager}
+	return configurationManager{configurationUtils: utils, configValidation: newConfigValidation(utils, eventRecorder), nvConfigUtils: nvConfigUtils, spectrumXConfigManager: spectrumXConfigManager, dmsManager: dmsManager}
 }

@@ -17,9 +17,9 @@ type DMSClient struct {
 	mock.Mock
 }
 
-// GetParameters provides a mock function with given fields: params
-func (_m *DMSClient) GetParameters(params []types.ConfigurationParameter) (map[string]string, error) {
-	ret := _m.Called(params)
+// GetParameters provides a mock function with given fields: ops
+func (_m *DMSClient) GetParameters(ops []types.DMSConfigOp) (map[string]string, error) {
+	ret := _m.Called(ops)
 
 	if len(ret) == 0 {
 		panic("no return value specified for GetParameters")
@@ -27,19 +27,19 @@ func (_m *DMSClient) GetParameters(params []types.ConfigurationParameter) (map[s
 
 	var r0 map[string]string
 	var r1 error
-	if rf, ok := ret.Get(0).(func([]types.ConfigurationParameter) (map[string]string, error)); ok {
-		return rf(params)
+	if rf, ok := ret.Get(0).(func([]types.DMSConfigOp) (map[string]string, error)); ok {
+		return rf(ops)
 	}
-	if rf, ok := ret.Get(0).(func([]types.ConfigurationParameter) map[string]string); ok {
-		r0 = rf(params)
+	if rf, ok := ret.Get(0).(func([]types.DMSConfigOp) map[string]string); ok {
+		r0 = rf(ops)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(map[string]string)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func([]types.ConfigurationParameter) error); ok {
-		r1 = rf(params)
+	if rf, ok := ret.Get(1).(func([]types.DMSConfigOp) error); ok {
+		r1 = rf(ops)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -95,17 +95,17 @@ func (_m *DMSClient) InstallBFB(ctx context.Context, version string, bfbPath str
 	return r0
 }
 
-// SetParameters provides a mock function with given fields: params
-func (_m *DMSClient) SetParameters(params []types.ConfigurationParameter) error {
-	ret := _m.Called(params)
+// SetParameters provides a mock function with given fields: ops
+func (_m *DMSClient) SetParameters(ops []types.DMSConfigOp) error {
+	ret := _m.Called(ops)
 
 	if len(ret) == 0 {
 		panic("no return value specified for SetParameters")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func([]types.ConfigurationParameter) error); ok {
-		r0 = rf(params)
+	if rf, ok := ret.Get(0).(func([]types.DMSConfigOp) error); ok {
+		r0 = rf(ops)
 	} else {
 		r0 = ret.Error(0)
 	}

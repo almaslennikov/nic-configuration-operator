@@ -1,0 +1,871 @@
+{
+  "plan": {
+    "name": "ra2.2-hwmp-prepare-nco",
+    "family": "spcx",
+    "profile": "ra2.2-hwmp",
+    "stage": "prepare",
+    "params": {
+      "overlay": "none",
+      "nic_type": "1023",
+      "num_vfs": 1,
+      "moe": false,
+      "xgs": false,
+      "deployment_mode": "host-k8s",
+      "ra_version": "RA2.2",
+      "multiplane_mode": "hwmp",
+      "planes": 2
+    },
+    "detected_hw": {
+      "hca_type": "ConnectX-8",
+      "nic_count": 1,
+      "platform_type": "vr",
+      "total_bw": 800,
+      "source": "file",
+      "target_map": {
+        "type": "test-cx8-xplane-dual",
+        "platform_type": "vr",
+        "inventory_stage": "pre_breakout"
+      }
+    },
+    "devices": [
+      {
+        "bdf": "0000:08:00.0",
+        "device_id": "0x1023",
+        "hca_type": "ConnectX-8",
+        "netdev": "enp8s0f0",
+        "rdma_dev": "mlx5_0",
+        "dms_target": "pci/0000:08:00.0",
+        "pf_index": 0,
+        "rail": 0,
+        "plane": 0,
+        "plane_explicit": true,
+        "network": "ew",
+        "physical_label": "osfp0",
+        "target_id": "ew-rail0-prebreakout"
+      }
+    ],
+    "post_breakout_devices": [
+      {
+        "bdf": "0000:08:00.0",
+        "device_id": "0x1023",
+        "hca_type": "ConnectX-8",
+        "netdev": null,
+        "rdma_dev": null,
+        "dms_target": "pci/0000:08:00.0",
+        "pf_index": 0,
+        "rail": 0,
+        "plane": 0,
+        "plane_explicit": true,
+        "network": "ew",
+        "physical_label": "osfp0",
+        "target_id": "ew-rail0-plane0"
+      },
+      {
+        "bdf": "0000:08:00.1",
+        "device_id": "0x1023",
+        "hca_type": "ConnectX-8",
+        "netdev": null,
+        "rdma_dev": null,
+        "dms_target": "pci/0000:08:00.1",
+        "pf_index": 0,
+        "rail": 0,
+        "plane": 1,
+        "plane_explicit": true,
+        "network": "ew",
+        "physical_label": "osfp0",
+        "target_id": "ew-rail0-plane1"
+      }
+    ],
+    "runtime_ctx": {
+      "deployment_mode": "host-k8s",
+      "multiplane_mode": "hwmp",
+      "esw_multiport": false,
+      "post_breakout": true,
+      "rdma_topology": "per_pf",
+      "expected_rdma": [
+        {
+          "rail": 0,
+          "plane": 0,
+          "rdma_dev": "mlx5_0",
+          "source": "device_inventory"
+        }
+      ]
+    },
+    "phases": {
+      "nvconfig": {
+        "operations": [
+          {
+            "path": "/nvidia/roce",
+            "values": {
+              "adaptive-routing": true,
+              "tx-sched-locality-mode": "accumulative",
+              "cc-steering-ext": "enabled"
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/cc/config",
+            "values": {
+              "user-programmable": true
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "num-pfs": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "num-planes": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[1]",
+            "values": {
+              "lanes": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[255]",
+            "values": {
+              "lanes": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/policy",
+            "values": {
+              "keep-eth-link-up": false
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "load-balance-mode": "transport"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/lag",
+            "values": {
+              "resource-allocation": "pre-allocation"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "sriov-enabled": true,
+              "max-vfs": 1
+            },
+            "source_feature": "spcx-hwmp-sriov-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/type",
+            "values": {
+              "value": "ETH"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/roce/rtt",
+            "values": {
+              "dscp": 48,
+              "dscp-mode": "fixed"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/eswitch/parser",
+            "values": {
+              "flex-parser-profile": 10
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "rde-disable": true,
+              "vf-log-bar-size": 5
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          }
+        ]
+      },
+      "boot": {
+        "steps": [],
+        "services": []
+      },
+      "link-event": {
+        "operations": [],
+        "operation_groups": {},
+        "vf_ops": []
+      }
+    },
+    "metadata": {
+      "substrate_version": "1.0",
+      "schema_version": "2.0",
+      "created_at": "2026-06-02T22:15:34.208866+00:00"
+    },
+    "prepare_phases": {
+      "breakout": {
+        "operations": [
+          {
+            "path": "/nvidia/roce",
+            "values": {
+              "adaptive-routing": true,
+              "tx-sched-locality-mode": "accumulative",
+              "cc-steering-ext": "enabled"
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/cc/config",
+            "values": {
+              "user-programmable": true
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "num-pfs": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "num-planes": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[1]",
+            "values": {
+              "lanes": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[255]",
+            "values": {
+              "lanes": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/policy",
+            "values": {
+              "keep-eth-link-up": false
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "load-balance-mode": "transport"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/lag",
+            "values": {
+              "resource-allocation": "pre-allocation"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "sriov-enabled": true,
+              "max-vfs": 1
+            },
+            "source_feature": "spcx-hwmp-sriov-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          }
+        ],
+        "device_view": "pre_breakout"
+      },
+      "nvconfig": {
+        "operations": [
+          {
+            "path": "/nvidia/link/type",
+            "values": {
+              "value": "ETH"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/roce/rtt",
+            "values": {
+              "dscp": 48,
+              "dscp-mode": "fixed"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/eswitch/parser",
+            "values": {
+              "flex-parser-profile": 10
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "rde-disable": true,
+              "vf-log-bar-size": 5
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          }
+        ],
+        "device_view": "post_breakout"
+      },
+      "rename": {
+        "steps": [],
+        "services": []
+      }
+    },
+    "execution_groups": [
+      {
+        "name": "breakout",
+        "stage": "prepare",
+        "order": 10,
+        "scope": "per_device",
+        "targets": [
+          {
+            "target": "pci/0000:08:00.0",
+            "bdf": "0000:08:00.0",
+            "netdev": "enp8s0f0",
+            "rail": 0,
+            "plane": 0,
+            "target_id": "ew-rail0-prebreakout"
+          }
+        ],
+        "operations": [
+          {
+            "path": "/nvidia/roce",
+            "values": {
+              "adaptive-routing": true,
+              "tx-sched-locality-mode": "accumulative",
+              "cc-steering-ext": "enabled"
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/cc/config",
+            "values": {
+              "user-programmable": true
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "num-pfs": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "num-planes": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[1]",
+            "values": {
+              "lanes": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[255]",
+            "values": {
+              "lanes": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/policy",
+            "values": {
+              "keep-eth-link-up": false
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "load-balance-mode": "transport"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/lag",
+            "values": {
+              "resource-allocation": "pre-allocation"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "sriov-enabled": true,
+              "max-vfs": 1
+            },
+            "source_feature": "spcx-hwmp-sriov-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          }
+        ]
+      },
+      {
+        "name": "post-breakout-nvconfig",
+        "stage": "prepare",
+        "order": 20,
+        "scope": "per_device",
+        "targets": [
+          {
+            "target": "pci/0000:08:00.0",
+            "bdf": "0000:08:00.0",
+            "netdev": null,
+            "rail": 0,
+            "plane": 0,
+            "target_id": "ew-rail0-plane0"
+          },
+          {
+            "target": "pci/0000:08:00.1",
+            "bdf": "0000:08:00.1",
+            "netdev": null,
+            "rail": 0,
+            "plane": 1,
+            "target_id": "ew-rail0-plane1"
+          }
+        ],
+        "operations": [
+          {
+            "path": "/nvidia/link/type",
+            "values": {
+              "value": "ETH"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/roce/rtt",
+            "values": {
+              "dscp": 48,
+              "dscp-mode": "fixed"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/eswitch/parser",
+            "values": {
+              "flex-parser-profile": 10
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "rde-disable": true,
+              "vf-log-bar-size": 5
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          }
+        ]
+      }
+    ],
+    "path_dialect": "nvidia-t1",
+    "semantic_groups": {
+      "breakout": {
+        "order": 10,
+        "scope": "per_device",
+        "operations": [
+          {
+            "path": "/nvidia/roce",
+            "values": {
+              "adaptive-routing": true,
+              "tx-sched-locality-mode": "accumulative",
+              "cc-steering-ext": "enabled"
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/cc/config",
+            "values": {
+              "user-programmable": true
+            },
+            "source_feature": "spcx-base-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "num-pfs": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "num-planes": 2
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[1]",
+            "values": {
+              "lanes": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/breakout/module/[0]/port/[255]",
+            "values": {
+              "lanes": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "source_feature": "ra22-hwmp-breakout-delta",
+            "prepare_phase": "breakout",
+            "condition": {
+              "knob": "@params.nic_type == '1023'"
+            },
+            "context": {
+              "hca_type": "ConnectX-8",
+              "device_hca_types": [
+                "ConnectX-8"
+              ],
+              "platform_type": "vr"
+            },
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/link/policy",
+            "values": {
+              "keep-eth-link-up": false
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/multiplane",
+            "values": {
+              "load-balance-mode": "transport"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/lag",
+            "values": {
+              "resource-allocation": "pre-allocation"
+            },
+            "source_feature": "ra22-hwmp-prepare-delta",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "sriov-enabled": true,
+              "max-vfs": 1
+            },
+            "source_feature": "spcx-hwmp-sriov-nvconfig",
+            "prepare_phase": "breakout",
+            "target_class": "pf_netdev_all"
+          }
+        ]
+      },
+      "post-breakout-nvconfig": {
+        "order": 20,
+        "scope": "per_device",
+        "operations": [
+          {
+            "path": "/nvidia/link/type",
+            "values": {
+              "value": "ETH"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/roce/rtt",
+            "values": {
+              "dscp": 48,
+              "dscp-mode": "fixed"
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/eswitch/parser",
+            "values": {
+              "flex-parser-profile": 10
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          },
+          {
+            "path": "/nvidia/pci",
+            "values": {
+              "rde-disable": true,
+              "vf-log-bar-size": 5
+            },
+            "source_feature": "ra22-hwmp-nvconfig-delta",
+            "prepare_phase": "nvconfig",
+            "target_class": "pf_netdev_all"
+          }
+        ]
+      }
+    }
+  },
+  "artifacts": {
+    "manifest": []
+  }
+}
