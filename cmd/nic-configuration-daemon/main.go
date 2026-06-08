@@ -174,6 +174,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	blueprintReconciler := &controller.BlueprintReconciler{
+		Client:    mgr.GetClient(),
+		Namespace: namespace,
+	}
+	if err = blueprintReconciler.SetupWithManager(mgr); err != nil {
+		log.Log.Error(err, "unable to create controller", "controller", "BlueprintReconciler")
+		os.Exit(1)
+	}
+
 	ctx := ctrl.SetupSignalHandler()
 
 	// Set the nic configuration wait label on the node to true until desired configuration is confirmed to be applied
