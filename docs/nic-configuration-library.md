@@ -37,7 +37,7 @@ rebootRequired, err := fwMgr.InstallFirmware(ctx, device, &types.FirmwareInstall
 
 // 3. Apply NV configuration
 nvUtils := nvconfig.NewNVConfigUtils()
-spectrumXMgr := spectrumx.NewSpectrumXConfigManager(dmsSrv, configs)
+spectrumXMgr := spectrumx.NewSpectrumXConfigManager(dmsSrv, "" /* blueprintsBaseDir */)
 cfgMgr := configuration.NewConfigurationManager(nil, dmsSrv, nvUtils, spectrumXMgr)
 result, err := cfgMgr.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
 ```
@@ -225,7 +225,7 @@ type DMSServer interface {
 func NewDMSServer() DMSServer
 
 // NewExternalDMSManager connects to an already-running external DMS server
-// authParams: authentication/security flags for dmsc (e.g. ["--insecure"],
+// authParams: authentication/security flags for dms-cli (e.g. ["--insecure"],
 // ["--tls-ca", "/ca.pem", "--tls-cert", "/cert.pem", "--tls-key", "/key.pem"],
 // ["-u", "user", "-p", "pass"])
 func NewExternalDMSManager(devices []v1alpha1.NicDevice, address string, authParams []string) DMSManager
@@ -239,10 +239,10 @@ type DMSClient interface {
     GetQoSSettings(interfaceName string) (*v1alpha1.QosSpec, error)
     // SetQoSSettings sets QoS on all ports of the device
     SetQoSSettings(spec *v1alpha1.QosSpec) error
-    // GetParameters returns current values for given DMS paths
-    GetParameters(params []types.ConfigurationParameter) (map[string]string, error)
-    // SetParameters batches all updates into single dmsc command
-    SetParameters(params []types.ConfigurationParameter) error
+    // GetParameters returns current leaf values for the given ops, keyed by "<path>/<leaf>"
+    GetParameters(ops []types.DMSConfigOp) (map[string]string, error)
+    // SetParameters applies the ops via dms-cli (one invocation per op)
+    SetParameters(ops []types.DMSConfigOp) error
     // InstallBFB installs BFB firmware on BlueField device
     InstallBFB(ctx context.Context, version string, bfbPath string) error
 }
@@ -252,37 +252,24 @@ type DMSClient interface {
 
 A single `dmsd` server process manages all NIC devices. Started with comma-separated PCI addresses via `--target_pci`. Port discovery starts from 9339, incrementing on conflict.
 
-Per-device `dmsClient` instances hold configurable `authParams` (e.g. `["--insecure"]` for local server, TLS/credential flags for external server) and use `--target <pci>` to address individual NICs:
+The client is the new T1/T2 `dms-cli` (the old `dmsc` form was retired — see `dms/t1_t2/arch/transition/SPCX_TRANSITION.md` §4). Per-device `dmsClient` instances hold configurable `authParams` and address NICs with `-t pci/<BDF>`:
 ```
-dmsc -a <address> <authParams...> --target 0000:08:00.0 get --path /path
-dmsc -a <address> <authParams...> --target 0000:08:00.0 set --update "path:::type:::value"
-```
-
-**Supported authentication flags** (passed via `authParams`):
-- `--insecure` — disable TLS (default for local server)
-- `-u <user> -p <pass>` — username/password authentication
-- `--tls-ca <path>` — server CA certificate
-- `--tls-cert <path>` — client TLS certificate
-- `--tls-key <path>` — client TLS private key
-- `--skip-verify` — skip server certificate verification
-
-#### Batch SetParameters
-
-`SetParameters` collects all update entries via `collectSetUpdates()` (expanding interface/port/priority combinations into individual `path:::type:::value` strings using `formatSetUpdate()`), then passes them to a single `dmsc set` command with multiple `--update` flags and `--timeout 5m`:
-
-```
-dmsc -a localhost:9339 --insecure --target 0000:08:00.0 set --timeout 5m \
-  --update "/interfaces/interface[name=p0]/nvidia/qos/config/trust-mode:::string:::dscp" \
-  --update "/interfaces/interface[name=p0]/nvidia/cc/config/priority[id=0]/np_enabled:::bool:::1" \
-  --update "/interfaces/interface[name=p0]/nvidia/cc/config/priority[id=1]/np_enabled:::bool:::1"
+dms-cli -a <address> <authParams...> -t pci/0000:08:00.0 --timeout 300s <path> <leaf>          # GET (+ --plain)
+dms-cli -a <address> <authParams...> -t pci/0000:08:00.0 --timeout 300s <path> <leaf>=<value>  # SET
 ```
 
-**Parameter expansion rules:**
-- Path contains `interface` → expanded per device port (with `[name=<iface>]` filter)
-- Path contains `priority` → additionally expanded for IDs 0–7 (with `[id=<n>]` filter)
-- Otherwise → single update entry with unfiltered path
+**Supported authentication flags** (passed via `authParams`): `--insecure`, `-u/-p`, `--tls-ca/--tls-cert/--tls-key`, `--skip-verify`.
 
-**IgnoreError semantics:** if the batch command fails and ALL params have `IgnoreError=true`, the error is suppressed.
+#### Op-based Set/Get
+
+`SetParameters` runs one `dms-cli` invocation per `types.DMSConfigOp` (`{Path, Values}`), emitting the path followed by sorted `<leaf>=<value>` assignments; the YANG type is inferred by `dms-cli`, so no explicit type tag is sent. `GetParameters` reads each leaf with `--plain` and returns `"<path>/<leaf>" -> value`. Example:
+
+```
+dms-cli -a localhost:9339 --insecure -t pci/0000:08:00.0 --timeout 300s \
+  /nvidia/roce adaptive-routing=true cc-steering-ext=enabled
+```
+
+Values are rendered by `types.StringifyDMSValue` (bool→`true`/`false`, integral→bare int, string→as-is, list→`[a,b,c]`).
 
 ---
 
@@ -294,15 +281,13 @@ Source: `pkg/spectrumx/spectrumx.go`
 
 ```go
 type SpectrumXManager interface {
-    // Breakout configuration (phase 1 — requires reboot)
-    BreakoutConfigApplied(ctx context.Context, device *v1alpha1.NicDevice) (bool, error)
-    ApplyBreakoutConfig(ctx context.Context, device *v1alpha1.NicDevice) (*types.ConfigurationApplyResult, error)
+    // GetPrepareOps returns the prepare-stage ops divided into breakout and
+    // post-breakout-nvconfig phases (rawNvConfig overrides applied). The
+    // ConfigurationManager owns checking/applying them (via DMS) so they sequence
+    // with other NVConfig options; breakout requires a reboot before post-breakout.
+    GetPrepareOps(device *v1alpha1.NicDevice) (breakout, postBreakout []types.DMSConfigOp, err error)
 
-    // NV configuration (phase 2 — applied after breakout reboot)
-    NvConfigApplied(ctx context.Context, device *v1alpha1.NicDevice) (bool, error)
-    ApplyNvConfig(ctx context.Context, device *v1alpha1.NicDevice) (*types.ConfigurationApplyResult, error)
-
-    // Runtime configuration (phase 3 — no reboot)
+    // Runtime (configure) configuration — link-runtime, eswitch, cc, link-event, no reboot
     RuntimeConfigApplied(device *v1alpha1.NicDevice) (bool, error)
     ApplyRuntimeConfig(device *v1alpha1.NicDevice) (*types.RuntimeConfigurationApplyResult, error)
 
@@ -317,18 +302,21 @@ type SpectrumXManager interface {
 ```go
 func NewSpectrumXConfigManager(
     dmsManager dms.DMSManager,
-    spectrumXConfigs map[string]*types.SpectrumXConfig,
+    blueprintsBaseDir string,
 ) SpectrumXManager
 ```
-- `spectrumXConfigs`: keyed by version string (e.g., `"RA1.3"`, `"RA2.0"`, `"RA2.1"`, `"RA2.2"`), loaded from YAML via `types.LoadSpectrumXConfig()`
+- `blueprintsBaseDir`: base directory under which blueprint ConfigMaps are materialized (one subdir per ConfigMap name); the planner consumes `<base>/<version>` via `--blueprints-root`. Pass `""` for the operator default (`consts.SpectrumXBlueprintsBaseDir`); library consumers pass their own directory.
 
-#### Two-Phase Configuration Flow
+#### Plan-driven configuration flow
 
-1. **Breakout** → select params by multiplane mode and plane count → apply via mlxconfig batch → reboot
-2. **NV config** → filter by `DeviceId`, `Breakout`, `Multiplane` → split into MLXConfig params (`SetNvConfigParametersBatch`) and DMS params (`SetParameters`) → apply in batch → reboot
-3. **Runtime** → RoCE, Adaptive Routing, Congestion Control, InterPacketGap settings applied via DMS and sysfs — no reboot
+The manager renders a do-SPCX plan for the device (via the planner, currently stubbed to the
+committed example plans — see [design-dms-blueprints-spcx.md](design-dms-blueprints-spcx.md)) and
+parses its `semantic_groups` into typed `DMSConfigOp`s:
 
-**Parameter filtering:** each `ConfigurationParameter` can be filtered by `DeviceId` (e.g., `"1023"` for CX8, `"1025"` for CX9, `"a2dc"` for BF3), `Breakout` (plane count), and `Multiplane` mode.
+1. **Prepare** — `GetPrepareOps` returns the breakout (order 10) + post-breakout-nvconfig (order 20) ops; the **ConfigurationManager** checks/applies them via DMS (`dms.OpsApplied` + `SetParameters`): breakout → reboot → post-breakout → reboot, sequenced with its other NVConfig options.
+2. **Runtime** (`ApplyRuntimeConfig`) → groups in ascending order: `link-runtime` (30), `eswitch` (40), `cc` (90), `link-event` (100). `doca_spcx_cc` is launched (and its startup window awaited) before the `cc` group's knobs are applied.
+
+`GetDocaCCTargetVersion` currently returns `""` (the plan does not yet carry a `doca_spcx_cc` binary version — open item O12), so the controller skips the version-specific install.
 
 #### CC Process Lifecycle
 
@@ -435,59 +423,23 @@ type VPD struct {
 }
 ```
 
-#### ConfigurationParameter
+#### DMSConfigOp
 
-Used by DMS client and Spectrum-X config. Loaded from YAML files in `bindata/spectrum-x/`.
-
-```go
-type ConfigurationParameter struct {
-    Name             string // Human-readable name
-    MlxConfig        string // mlxconfig parameter name (e.g., "LINK_TYPE_P1")
-    Value            string // Value to set
-    ValueType        string // DMS value type: "string", "bool", "int"
-    DMSPath          string // DMS path (e.g., "/interfaces/interface/nvidia/qos/config/trust-mode")
-    AlternativeValue string // Alternative value representation
-    DeviceId         string // Device ID filter (e.g., "1023", "a2dc")
-    Breakout         int    // Plane count filter (1, 2, 4)
-    Multiplane       string // Multiplane mode filter (none, swplb, hwplb, uniplane)
-    IgnoreError      bool   // Suppress errors for this parameter in batch operations
-}
-```
-
-A parameter with `MlxConfig` set is applied via `nvconfig.SetNvConfigParametersBatch()`; a parameter with `DMSPath` set is applied via `dms.DMSClient.SetParameters()`.
-
-#### Spectrum-X Config Types
+The apply currency for the do-SPCX plan flow — one semantic-group operation, mapping 1:1 onto a
+`dms-cli` invocation. The plan parser produces these from `semantic_groups`; the DMS client applies
+them. The legacy `ConfigurationParameter`, `SpectrumXConfig` recipe types and `LoadSpectrumXConfig`
+were removed — DMS is the source of truth (see [design-dms-blueprints-spcx.md](design-dms-blueprints-spcx.md)).
 
 ```go
-type SpectrumXConfig struct {
-    BreakoutConfig         SpectrumXBreakoutConfig
-    NVConfig               []ConfigurationParameter
-    RuntimeConfig          SpectrumXRuntimeConfig
-    UseSoftwareCCAlgorithm bool   // Use software congestion control
-    DocaCCVersion          string // Required DOCA CC version
+type DMSConfigOp struct {
+    Path   string         // YANG container path, e.g. /nvidia/roce
+    Values map[string]any // leaf -> JSON-decoded typed value (bool/float64/string/[]any)
 }
 
-type SpectrumXBreakoutConfig struct {
-    Swplb    map[int][]ConfigurationParameter // keyed by plane count
-    Hwplb    map[int][]ConfigurationParameter
-    Uniplane map[int][]ConfigurationParameter
-    None     map[int][]ConfigurationParameter
-}
-
-type SpectrumXRuntimeConfig struct {
-    Roce              []ConfigurationParameter
-    AdaptiveRouting   []ConfigurationParameter
-    CongestionControl []ConfigurationParameter
-    InterPacketGap    InterPacketGapConfig
-}
-
-type InterPacketGapConfig struct {
-    PureL3 []ConfigurationParameter // Pure L3 overlay mode
-    L3EVPN []ConfigurationParameter // L3 EVPN overlay mode
-}
+// StringifyDMSValue renders a value as a dms-cli assignment value
+// (bool->true/false, integral->bare int, string->as-is, list->[a,b,c]).
+func StringifyDMSValue(v any) (string, error)
 ```
-
-**Loading:** `func LoadSpectrumXConfig(configPath string) (*SpectrumXConfig, error)` — reads YAML file.
 
 #### Error Helpers
 
@@ -499,10 +451,6 @@ func IsIncorrectSpecError(err error) bool
 // Firmware source not ready
 func FirmwareSourceNotReadyError(firmwareSourceName, msg string) error
 func IsFirmwareSourceNotReadyError(err error) bool
-
-// Values mismatch across ports/priorities
-func ValuesDoNotMatchError(param ConfigurationParameter, value string) error
-func IsValuesDoNotMatchError(err error) bool
 ```
 
 ---
