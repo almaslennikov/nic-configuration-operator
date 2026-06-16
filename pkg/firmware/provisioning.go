@@ -83,8 +83,8 @@ type firmwareProvisioner struct {
 
 // IsFWStorageAvailable checks if the cache storage exists in the pod.
 func (f firmwareProvisioner) IsFWStorageAvailable() error {
-	log.Log.V(2).Info("FirmwareProvisioner.IsFWStorageAvailable()")
-	_, err := os.Stat(consts.NicFirmwareStorage)
+	log.Log.V(2).Info("FirmwareProvisioner.IsFWStorageAvailable()", "cacheRootDir", f.cacheRootDir)
+	_, err := os.Stat(f.cacheRootDir)
 	return err
 }
 
@@ -651,5 +651,12 @@ func readSingleFileMetadataFromFile(path string) (singleFileMetadata, error) {
 }
 
 func NewFirmwareProvisioner() FirmwareProvisioner {
-	return firmwareProvisioner{cacheRootDir: consts.NicFirmwareStorage, utils: newFirmwareUtils()}
+	return NewFirmwareProvisionerWithCacheDir(consts.NicFirmwareStorage)
+}
+
+// NewFirmwareProvisionerWithCacheDir returns a FirmwareProvisioner that downloads and caches
+// firmware under the given root directory. Used by the daemon in local-storage mode to provision
+// firmware into a node-local cache instead of a shared PVC.
+func NewFirmwareProvisionerWithCacheDir(cacheRootDir string) FirmwareProvisioner {
+	return firmwareProvisioner{cacheRootDir: cacheRootDir, utils: newFirmwareUtils()}
 }

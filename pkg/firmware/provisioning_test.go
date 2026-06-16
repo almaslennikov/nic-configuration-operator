@@ -996,3 +996,17 @@ var _ = Describe("FirmwareProvisioner", func() {
 		})
 	})
 })
+
+var _ = Describe("NewFirmwareProvisionerWithCacheDir", func() {
+	It("honors the configured cache root for IsFWStorageAvailable", func() {
+		dir, err := os.MkdirTemp("/tmp", "fwstorage-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(dir) }()
+
+		Expect(NewFirmwareProvisionerWithCacheDir(dir).IsFWStorageAvailable()).To(Succeed())
+	})
+
+	It("reports storage unavailable when the configured cache root does not exist", func() {
+		Expect(NewFirmwareProvisionerWithCacheDir("/no/such/firmware/cache/dir").IsFWStorageAvailable()).NotTo(Succeed())
+	})
+})

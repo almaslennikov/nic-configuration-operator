@@ -127,8 +127,16 @@ const (
 
 	FwConfigNotAppliedAfterRebootErrorMsg = "firmware configuration failed to apply after reboot"
 
-	NicFirmwareStorage             = "/nic-firmware"
-	NicFirmwareBinariesFolder      = "firmware-binaries"
+	NicFirmwareStorage        = "/nic-firmware"
+	NicFirmwareBinariesFolder = "firmware-binaries"
+
+	// FirmwareStorageModeEnv selects how the daemon obtains firmware binaries.
+	// "local": the daemon downloads firmware to a node-local cache (no shared PVC required).
+	// unset / "pvc": the daemon reads firmware from a shared PVC populated by the operator.
+	FirmwareStorageModeEnv   = "FIRMWARE_STORAGE_MODE"
+	FirmwareStorageModeLocal = "local"
+	FirmwareStorageModePVC   = "pvc"
+
 	BFBFolder                      = "bfb"
 	DocaSpcXCCFolder               = "doca-spc-x-cc"
 	NicFirmwareBinaryFileExtension = ".bin"

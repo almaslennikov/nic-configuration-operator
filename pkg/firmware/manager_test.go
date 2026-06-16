@@ -29,6 +29,7 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/Mellanox/nic-configuration-operator/api/v1alpha1"
@@ -763,6 +764,188 @@ var _ = Describe("FirmwareManager", func() {
 			err := manager.InstallDocaSpcXCC(context.Background(), createNicDevice(), targetVer)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("install fail"))
+		})
+	})
+
+	Describe("local-storage mode (provisioner set)", func() {
+		var (
+			provMock    *mocks.FirmwareProvisioner
+			fwUtilsMock *mocks.FirmwareUtils
+			cacheRoot   string
+			tmpDir      string
+			binURLs     = []string{"https://example.com/fw.zip"}
+			bfbURL      = "https://example.com/fw.bfb"
+			docaURL     = "https://example.com/doca.deb"
+			fwVersion   = "22.41.00"
+		)
+
+		buildClient := func(src *v1alpha1.NicFirmwareSource) client.Client {
+			scheme := runtime.NewScheme()
+			Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
+			b := fake.NewClientBuilder().WithScheme(scheme)
+			if src != nil {
+				b = b.WithObjects(src)
+			}
+			return b.Build()
+		}
+
+		connectXSource := func() *v1alpha1.NicFirmwareSource {
+			return &v1alpha1.NicFirmwareSource{
+				ObjectMeta: v1.ObjectMeta{Name: fwSourceName},
+				Spec:       v1alpha1.NicFirmwareSourceSpec{BinUrlSources: binURLs},
+			}
+		}
+
+		writeBin := func() {
+			fwFolder := path.Join(cacheRoot, fwSourceName, consts.NicFirmwareBinariesFolder, fwVersion, psid)
+			Expect(os.MkdirAll(fwFolder, 0755)).To(Succeed())
+			Expect(os.WriteFile(path.Join(fwFolder, "fw.bin"), []byte(""), 0644)).To(Succeed())
+		}
+
+		newManager := func(cli client.Client) FirmwareManager {
+			return firmwareManager{
+				client:       cli,
+				utils:        fwUtilsMock,
+				provisioner:  provMock,
+				cacheLocks:   newKeyedMutex(),
+				cacheRootDir: cacheRoot,
+				tmpDir:       tmpDir,
+				namespace:    "",
+			}
+		}
+
+		BeforeEach(func() {
+			provMock = &mocks.FirmwareProvisioner{}
+			fwUtilsMock = &mocks.FirmwareUtils{}
+
+			var err error
+			tmpDir, err = os.MkdirTemp("/tmp", "fw-local-tmp-*")
+			Expect(err).NotTo(HaveOccurred())
+			cacheRoot, err = os.MkdirTemp("/tmp", "fw-local-cache-*")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			provMock.AssertExpectations(GinkgoT())
+			fwUtilsMock.AssertExpectations(GinkgoT())
+			_ = os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(cacheRoot)
+		})
+
+		It("downloads ConnectX firmware when not cached locally, then burns", func() {
+			manager := newManager(buildClient(connectXSource()))
+			tempBin := path.Join(tmpDir, "fw.bin")
+
+			fwUtilsMock.On("GetFirmwareVersionsFromDevice", pci).Return("22.39.00", "22.39.00", nil).Once()
+			provMock.On("VerifyCachedBinaries", fwSourceName, binURLs).Return(binURLs, nil).Once()
+			provMock.On("DownloadAndUnzipFirmwareArchives", fwSourceName, binURLs, true).
+				Run(func(mock.Arguments) { writeBin() }).Return(nil).Once()
+			provMock.On("AddFirmwareBinariesToCacheByMetadata", fwSourceName).Return(nil).Once()
+			fwUtilsMock.On("GetFirmwareVersionAndPSIDFromFWBinary", tempBin).Return(fwVersion, psid, nil).Once()
+			fwUtilsMock.On("VerifyImageBootable", tempBin).Return(nil).Once()
+			fwUtilsMock.On("BurnNicFirmware", mock.Anything, pci, tempBin).Return(nil).Once()
+
+			_, err := manager.InstallFirmware(context.Background(), createNicDevice(), &types.FirmwareInstallOptions{Version: fwVersion, SkipReset: true})
+			Expect(err).To(Succeed())
+		})
+
+		It("skips download when ConnectX firmware is already cached locally", func() {
+			manager := newManager(buildClient(connectXSource()))
+			writeBin()
+			tempBin := path.Join(tmpDir, "fw.bin")
+
+			fwUtilsMock.On("GetFirmwareVersionsFromDevice", pci).Return("22.39.00", "22.39.00", nil).Once()
+			provMock.On("VerifyCachedBinaries", fwSourceName, binURLs).Return([]string{}, nil).Once()
+			fwUtilsMock.On("GetFirmwareVersionAndPSIDFromFWBinary", tempBin).Return(fwVersion, psid, nil).Once()
+			fwUtilsMock.On("VerifyImageBootable", tempBin).Return(nil).Once()
+			fwUtilsMock.On("BurnNicFirmware", mock.Anything, pci, tempBin).Return(nil).Once()
+
+			_, err := manager.InstallFirmware(context.Background(), createNicDevice(), &types.FirmwareInstallOptions{Version: fwVersion, SkipReset: true})
+			Expect(err).To(Succeed())
+			provMock.AssertNotCalled(GinkgoT(), "DownloadAndUnzipFirmwareArchives", mock.Anything, mock.Anything, mock.Anything)
+		})
+
+		It("does not consult the provisioner when the burned version already matches", func() {
+			manager := newManager(buildClient(connectXSource()))
+
+			fwUtilsMock.On("GetFirmwareVersionsFromDevice", pci).Return(fwVersion, fwVersion, nil).Once()
+
+			_, err := manager.InstallFirmware(context.Background(), createNicDevice(), &types.FirmwareInstallOptions{Version: fwVersion, SkipReset: true})
+			Expect(err).To(Succeed())
+			provMock.AssertNotCalled(GinkgoT(), "VerifyCachedBinaries", mock.Anything, mock.Anything)
+		})
+
+		It("returns an error when the local download fails", func() {
+			manager := newManager(buildClient(connectXSource()))
+
+			fwUtilsMock.On("GetFirmwareVersionsFromDevice", pci).Return("22.39.00", "22.39.00", nil).Once()
+			provMock.On("VerifyCachedBinaries", fwSourceName, binURLs).Return(binURLs, nil).Once()
+			provMock.On("DownloadAndUnzipFirmwareArchives", fwSourceName, binURLs, true).Return(errors.New("network down")).Once()
+
+			_, err := manager.InstallFirmware(context.Background(), createNicDevice(), &types.FirmwareInstallOptions{Version: fwVersion, SkipReset: true})
+			Expect(err).To(MatchError(ContainSubstring("network down")))
+		})
+
+		It("downloads BFB when not cached locally, then installs via DMS", func() {
+			dmsManagerMock := &dmsMocks.DMSManager{}
+			dmsClientMock := &dmsMocks.DMSClient{}
+			defer dmsManagerMock.AssertExpectations(GinkgoT())
+			defer dmsClientMock.AssertExpectations(GinkgoT())
+
+			src := &v1alpha1.NicFirmwareSource{
+				ObjectMeta: v1.ObjectMeta{Name: fwSourceName},
+				Spec:       v1alpha1.NicFirmwareSourceSpec{BFBUrlSource: bfbURL},
+			}
+			device := createNicDevice()
+			device.Status.Type = consts.BlueField3DeviceID
+			device.Status.SerialNumber = "test-serial-123"
+			bfVersion := "24.35.1000"
+
+			manager := firmwareManager{
+				client:       buildClient(src),
+				dmsManager:   dmsManagerMock,
+				utils:        fwUtilsMock,
+				provisioner:  provMock,
+				cacheLocks:   newKeyedMutex(),
+				cacheRootDir: cacheRoot,
+				tmpDir:       tmpDir,
+			}
+			expectedBFB := path.Join(cacheRoot, fwSourceName, consts.BFBFolder, "fw.bfb")
+
+			fwUtilsMock.On("GetFirmwareVersionsFromDevice", pci).Return("0", "0", nil).Once()
+			provMock.On("VerifyCachedBFB", fwSourceName, bfbURL).Return(true, nil).Once()
+			provMock.On("DownloadBFB", fwSourceName, bfbURL).Run(func(mock.Arguments) {
+				bfbDir := path.Join(cacheRoot, fwSourceName, consts.BFBFolder)
+				Expect(os.MkdirAll(bfbDir, 0755)).To(Succeed())
+				Expect(os.WriteFile(path.Join(bfbDir, "fw.bfb"), []byte("x"), 0644)).To(Succeed())
+			}).Return("fw.bfb", nil).Once()
+			dmsManagerMock.On("GetDMSClientByPCIAddress", "0000:3b:00").Return(dmsClientMock, nil).Once()
+			fwUtilsMock.On("EnsureDeviceBoundToMlx5Core", pci).Return(nil).Once()
+			dmsClientMock.On("InstallBFB", mock.Anything, bfVersion, expectedBFB).Return(nil).Once()
+
+			_, err := manager.InstallFirmware(context.Background(), device, &types.FirmwareInstallOptions{Version: bfVersion, SkipReset: true})
+			Expect(err).To(Succeed())
+		})
+
+		It("downloads the DOCA SPC-X CC package when not cached locally, then installs it", func() {
+			src := &v1alpha1.NicFirmwareSource{
+				ObjectMeta: v1.ObjectMeta{Name: fwSourceName},
+				Spec:       v1alpha1.NicFirmwareSourceSpec{DocaSpcXCCUrlSource: docaURL},
+				Status:     v1alpha1.NicFirmwareSourceStatus{DocaSpcXCCVersion: "1.2.3"},
+			}
+			manager := newManager(buildClient(src))
+			debDir := path.Join(cacheRoot, fwSourceName, consts.DocaSpcXCCFolder)
+			debPath := path.Join(debDir, "doca.deb")
+
+			fwUtilsMock.On("GetInstalledDebPackageVersion", "doca-spcx-cc").Return("").Once()
+			provMock.On("VerifyCachedDocaSpcXCC", fwSourceName, docaURL).Return(true, nil).Once()
+			provMock.On("DownloadDocaSpcXCC", fwSourceName, docaURL).Run(func(mock.Arguments) {
+				Expect(os.MkdirAll(debDir, 0755)).To(Succeed())
+				Expect(os.WriteFile(debPath, []byte("d"), 0644)).To(Succeed())
+			}).Return("doca.deb", nil).Once()
+			fwUtilsMock.On("InstallDebPackage", debPath).Return(nil).Once()
+
+			Expect(manager.InstallDocaSpcXCC(context.Background(), createNicDevice(), "1.2.3")).To(Succeed())
 		})
 	})
 })

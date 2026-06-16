@@ -127,7 +127,20 @@ func main() {
 	configurationManager := configuration.NewConfigurationManager(
 		eventRecorder, dmsServer, nvConfigUtils, spectrumXConfigManager)
 	maintenanceManager := maintenance.New(mgr.GetClient(), hostUtils, nodeName, namespace)
-	firmwareManager := firmware.NewFirmwareManager(mgr.GetClient(), dmsServer, namespace)
+
+	// In local-storage mode the daemon downloads firmware to a node-local cache itself, removing the
+	// need for a shared PVC. The operator still validates each NicFirmwareSource and populates its
+	// status; here we only fetch the source's URLs and provision what this node's devices need.
+	// Default (FIRMWARE_STORAGE_MODE unset or "pvc") preserves the shared-PVC behavior.
+	var firmwareManager firmware.FirmwareManager
+	if os.Getenv(consts.FirmwareStorageModeEnv) == consts.FirmwareStorageModeLocal {
+		log.Log.Info("firmware storage mode: local (daemon downloads firmware to node-local cache)")
+		provisioner := firmware.NewFirmwareProvisionerWithCacheDir(consts.NicFirmwareStorage)
+		firmwareManager = firmware.NewFirmwareManagerWithProvisioner(
+			mgr.GetClient(), dmsServer, namespace, provisioner, consts.NicFirmwareStorage)
+	} else {
+		firmwareManager = firmware.NewFirmwareManager(mgr.GetClient(), dmsServer, namespace)
+	}
 
 	if err := initNicFwMap(namespace); err != nil {
 		log.Log.Error(err, "unable to init NicFwMap")

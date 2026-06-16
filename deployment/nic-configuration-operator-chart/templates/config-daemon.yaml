@@ -1,3 +1,8 @@
+{{- $fwStorage := .Values.nicFirmwareStorage | default dict -}}
+{{- $fwMode := $fwStorage.mode | default "local" -}}
+{{- if $fwStorage.pvcName }}{{- $fwMode = "pvc" -}}{{- end -}}
+{{- $localStorage := $fwStorage.localStorage | default dict -}}
+{{- $localType := $localStorage.type | default "hostPath" -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -31,6 +36,7 @@ spec:
       containers:
         - image: "{{ .Values.configDaemon.image.repository }}/{{ .Values.configDaemon.image.name }}:{{ .Values.configDaemon.image.tag | default .Chart.AppVersion }}"
           name: nic-configuration-daemon
+          imagePullPolicy: Always
           securityContext:
             privileged: true
           resources: {{- toYaml .Values.configDaemon.resources | nindent 12 }}
@@ -43,6 +49,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: FIRMWARE_STORAGE_MODE
+              value: {{ $fwMode | quote }}
             {{- if .Values.configDaemon.env }}
             {{- toYaml .Values.configDaemon.env | nindent 12 }}
             {{- end }}
@@ -62,11 +70,10 @@ spec:
             - name: dev
               mountPath: /dev
               readOnly: false
-            {{- if .Values.nicFirmwareStorage.pvcName }}
             - name: firmware-cache
               mountPath: /nic-firmware
-              readOnly: true
-            {{- end }}
+              # PVC mode mounts the shared cache read-only; local mode needs to write downloads.
+              readOnly: {{ eq $fwMode "pvc" }}
       volumes:
         - name: sys
           hostPath:
@@ -80,8 +87,14 @@ spec:
         - name: dev
           hostPath:
             path: /dev
-        {{- if .Values.nicFirmwareStorage.pvcName }}
         - name: firmware-cache
+        {{- if eq $fwMode "pvc" }}
           persistentVolumeClaim:
-            claimName: {{ .Values.nicFirmwareStorage.pvcName }}
+            claimName: {{ $fwStorage.pvcName }}
+        {{- else if eq $localType "hostPath" }}
+          hostPath:
+            path: {{ $localStorage.hostPath | default "/var/lib/nvidia/nic-configuration-operator/firmware" }}
+            type: DirectoryOrCreate
+        {{- else }}
+          emptyDir: {}
         {{- end }}

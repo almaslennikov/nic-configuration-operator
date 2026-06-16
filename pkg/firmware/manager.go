@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -71,9 +72,42 @@ type firmwareManager struct {
 
 	utils FirmwareUtils
 
+	// provisioner is set in local-storage mode (daemon downloads firmware to a node-local cache
+	// instead of reading it from a shared PVC). When nil (shared-PVC / library mode), the manager
+	// never downloads — it only resolves firmware from the already-populated cache.
+	provisioner FirmwareProvisioner
+	// cacheLocks serializes per-source local downloads so a node with multiple NICs sharing one
+	// NicFirmwareSourceRef downloads each source's firmware once. Pointer so the value-receiver
+	// methods don't copy a lock. Nil when provisioner is nil.
+	cacheLocks *keyedMutex
+
 	cacheRootDir string
 	namespace    string
 	tmpDir       string
+}
+
+// keyedMutex provides a separate mutex per string key.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func newKeyedMutex() *keyedMutex {
+	return &keyedMutex{locks: map[string]*sync.Mutex{}}
+}
+
+// lock acquires the mutex for the given key and returns its unlock function.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	m, ok := k.locks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		k.locks[key] = m
+	}
+	k.mu.Unlock()
+
+	m.Lock()
+	return m.Unlock
 }
 
 // ValidateRequestedFirmwareSource will validate the NicFirmwareSource object, requested for NicDevice
@@ -158,6 +192,12 @@ func (f firmwareManager) InstallDocaSpcXCC(ctx context.Context, device *v1alpha1
 		return fmt.Errorf("DOCA SPC-X CC version (%s) doesn't match target version (%s)", provisionedVersion, targetVersion)
 	}
 
+	// In local-storage mode, download the package to the node-local cache if it isn't there yet.
+	// No-op when provisioner is nil (shared-PVC / library mode).
+	if err := f.ensureLocalDocaSpcXCCCached(fwSourceName, &fwSourceObj); err != nil {
+		return err
+	}
+
 	cacheDir := path.Join(f.cacheRootDir, fwSourceName, consts.DocaSpcXCCFolder)
 	docaSpcXCCPath := ""
 	err = filepath.WalkDir(cacheDir, func(path string, d os.DirEntry, err error) error {
@@ -239,6 +279,13 @@ func (f firmwareManager) InstallFirmware(ctx context.Context, device *v1alpha1.N
 	// Resolve firmware file path from cache if not provided directly
 	fwFilePath := options.FwFilePath
 	if fwFilePath == "" {
+		// In local-storage mode, download the firmware to the node-local cache if it isn't there yet.
+		// Placed after the idempotency check above so a device already at the requested version never
+		// triggers a download. No-op when provisioner is nil (shared-PVC / library mode).
+		if err = f.ensureLocalFirmwareCached(ctx, device); err != nil {
+			return false, err
+		}
+
 		fwFilePath, err = f.resolveFirmwareFilePath(device, version)
 		if err != nil {
 			return false, err
@@ -459,4 +506,125 @@ func (f firmwareManager) GetFirmwareVersionsFromDevice(device *v1alpha1.NicDevic
 
 func NewFirmwareManager(client client.Client, dmsManager dms.DMSManager, namespace string) FirmwareManager {
 	return &firmwareManager{client: client, dmsManager: dmsManager, cacheRootDir: consts.NicFirmwareStorage, namespace: namespace, tmpDir: consts.TempDir, utils: newFirmwareUtils()}
+}
+
+// NewFirmwareManagerWithProvisioner returns a FirmwareManager for local-storage mode. In addition to
+// resolving and installing firmware, it downloads the firmware referenced by a NicFirmwareSource into
+// the node-local cache (cacheRootDir) on demand, removing the need for a shared PVC. The operator still
+// validates the NicFirmwareSource and populates its status; this manager fetches the source's spec URLs
+// and provisions only what the device needs, when InstallFirmware/InstallDocaSpcXCC require a file that
+// isn't already cached locally.
+func NewFirmwareManagerWithProvisioner(client client.Client, dmsManager dms.DMSManager, namespace string, provisioner FirmwareProvisioner, cacheRootDir string) FirmwareManager {
+	return &firmwareManager{
+		client:       client,
+		dmsManager:   dmsManager,
+		provisioner:  provisioner,
+		cacheLocks:   newKeyedMutex(),
+		cacheRootDir: cacheRootDir,
+		namespace:    namespace,
+		tmpDir:       consts.TempDir,
+		utils:        newFirmwareUtils(),
+	}
+}
+
+// ensureLocalFirmwareCached downloads the firmware referenced by the device's NicFirmwareSource into the
+// node-local cache if it isn't present yet. No-op in shared-PVC / library mode (provisioner == nil).
+// Reuses the same provisioning pipeline the operator controller runs, so the resulting on-disk layout is
+// identical and resolveFirmwareFilePath works unchanged.
+func (f firmwareManager) ensureLocalFirmwareCached(ctx context.Context, device *v1alpha1.NicDevice) error {
+	if f.provisioner == nil {
+		return nil
+	}
+	if device.Spec.Firmware == nil {
+		return errors.New("device's firmware spec is empty")
+	}
+
+	cacheName := device.Spec.Firmware.NicFirmwareSourceRef
+
+	// Serialize per-source so multiple NICs sharing a source download it once.
+	unlock := f.cacheLocks.lock(cacheName)
+	defer unlock()
+
+	fwSourceObj := v1alpha1.NicFirmwareSource{}
+	if err := f.client.Get(ctx, k8sTypes.NamespacedName{Name: cacheName, Namespace: f.namespace}, &fwSourceObj); err != nil {
+		log.Log.Error(err, "failed to get NicFirmwareSource obj for local provisioning", "name", cacheName)
+		return err
+	}
+
+	if utilsPkg.IsBlueFieldDevice(device.Status.Type) {
+		url := fwSourceObj.Spec.BFBUrlSource
+		if url == "" {
+			return fmt.Errorf("requested firmware source (%s) has no BFB url to download", cacheName)
+		}
+
+		needsDownload, err := f.provisioner.VerifyCachedBFB(cacheName, url)
+		if err != nil {
+			return err
+		}
+		if !needsDownload {
+			log.Log.V(2).Info("BFB already present in local cache, skipping download", "cacheName", cacheName)
+			return nil
+		}
+
+		log.Log.Info("Downloading BFB to local cache", "cacheName", cacheName, "url", url)
+		if _, err := f.provisioner.DownloadBFB(cacheName, url); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	urls := fwSourceObj.Spec.BinUrlSources
+	if len(urls) == 0 {
+		return fmt.Errorf("requested firmware source (%s) has no firmware binary urls to download", cacheName)
+	}
+
+	urlsToProcess, err := f.provisioner.VerifyCachedBinaries(cacheName, urls)
+	if err != nil {
+		return err
+	}
+	if len(urlsToProcess) == 0 {
+		log.Log.V(2).Info("Firmware binaries already present in local cache, skipping download", "cacheName", cacheName)
+		return nil
+	}
+
+	log.Log.Info("Downloading firmware binaries to local cache", "cacheName", cacheName, "urls", urlsToProcess)
+	if err := f.provisioner.DownloadAndUnzipFirmwareArchives(cacheName, urlsToProcess, true); err != nil {
+		return err
+	}
+	if err := f.provisioner.AddFirmwareBinariesToCacheByMetadata(cacheName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ensureLocalDocaSpcXCCCached downloads the DOCA SPC-X CC .deb package referenced by the firmware source
+// into the node-local cache if it isn't present yet. No-op in shared-PVC / library mode.
+func (f firmwareManager) ensureLocalDocaSpcXCCCached(cacheName string, fwSourceObj *v1alpha1.NicFirmwareSource) error {
+	if f.provisioner == nil {
+		return nil
+	}
+
+	url := fwSourceObj.Spec.DocaSpcXCCUrlSource
+	if url == "" {
+		return fmt.Errorf("requested firmware source (%s) has no DOCA SPC-X CC url to download", cacheName)
+	}
+
+	unlock := f.cacheLocks.lock(cacheName)
+	defer unlock()
+
+	needsDownload, err := f.provisioner.VerifyCachedDocaSpcXCC(cacheName, url)
+	if err != nil {
+		return err
+	}
+	if !needsDownload {
+		log.Log.V(2).Info("DOCA SPC-X CC package already present in local cache, skipping download", "cacheName", cacheName)
+		return nil
+	}
+
+	log.Log.Info("Downloading DOCA SPC-X CC package to local cache", "cacheName", cacheName, "url", url)
+	if _, err := f.provisioner.DownloadDocaSpcXCC(cacheName, url); err != nil {
+		return err
+	}
+	return nil
 }

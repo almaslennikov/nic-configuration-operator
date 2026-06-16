@@ -1,10 +1,10 @@
 operator:
   image:
     # -- repository to use for the operator image
-    repository: ghcr.io/mellanox
+    repository: harbor.mellanox.com/cloud-orchestration-dev
     name: nic-configuration-operator
     # -- image tag to use for the operator image
-    tag: latest
+    tag: set_system_conf
   # -- tolerations for the operator
   tolerations:
     - key: "node-role.kubernetes.io/master"
@@ -46,39 +46,46 @@ operator:
 configDaemon:
   image:
     # -- repository to use for the config daemon image
-    repository: ghcr.io/mellanox
+    repository: harbor.mellanox.com/cloud-orchestration-dev
     name: nic-configuration-operator-daemon
     # -- image tag to use for the config daemon image
-    tag: latest
+    tag: set_system_conf
   # -- environment variables for the config daemon
   # env:
     # -- feature gate to enable FW reset after nv config update
     # - name: FW_RESET_AFTER_CONFIG_UPDATE
     #   value: "true"
   # -- node selector for the config daemon
-  nodeSelector:
-    network.nvidia.com/operator.mofed.wait: "false"
   # -- resources and limits for the config daemon
   resources:
-    limits:
-      cpu: 500m
-      memory: 128Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 512Mi
 
 # -- log level configuration (debug|info)
 logLevel: info
 # -- image pull secrets for both the operator and the config daemon
 imagePullSecrets: []
 
-# -- settings to enable the NIC Firmware Storage
+# -- settings for the firmware cache used during NIC firmware updates
 nicFirmwareStorage:
-  # -- create a new pvc or use an existing one
-  create: true
-  # -- name of the PVC to mount as NIC Firmware storage. If set to empty string, the NIC FW upgrade feature will be disabled.
-  pvcName: nic-fw-storage-pvc
-  # -- storage class name to be used to store NIC FW binaries during NIC FW upgrade. If not provided, the cluster-default storage class will be used
+  # -- storage mode: "local" (each daemon downloads the firmware it needs to node-local storage,
+  #    no shared PVC required) or "pvc" (operator downloads to a shared ReadWriteMany PVC that all
+  #    daemons read). Setting pvcName below forces "pvc" mode regardless of this value. In both modes
+  #    the operator still validates each NicFirmwareSource and populates its status.
+  mode: local
+  # -- node-local storage backing for the daemon when mode is "local"
+  localStorage:
+    # -- "hostPath" (default; cache persists across daemon restarts and supports air-gapped
+    #    pre-staging) or "emptyDir" (ephemeral; re-downloaded on every daemon pod restart)
+    type: hostPath
+    # -- host directory used when type is "hostPath"
+    hostPath: /var/lib/nvidia/nic-configuration-operator/firmware
+  # -- (pvc mode) create a new pvc for the firmware cache or use an existing one
+  create: false
+  # -- (pvc mode) name of the PVC for the shared firmware cache; setting this forces "pvc" mode
+  pvcName: ""
+  # -- (pvc mode) storage class for the created PVC (empty uses the cluster default)
   storageClassName: ""
-  # -- storage size for the NIC Configuration Operator to request. 1Gi is the default value when not provided
+  # -- (pvc mode) requested size for the created PVC
   availableStorageSize: 1Gi
